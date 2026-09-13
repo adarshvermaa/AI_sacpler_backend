@@ -9,6 +9,7 @@ Pipeline Stages:
 """
 
 import time
+import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 import numpy as np
@@ -60,6 +61,57 @@ class MarketScreener:
             self.raw_universe = universe
             logger.info(f"Initialized fallback universe with {len(self.raw_universe)} instruments")
 
+    async def _fetch_and_cache_candles(self, symbol: str) -> Optional[Dict[str, np.ndarray]]:
+        """Fetch 240 real 1m historical candlestick bars directly from CoinDCX."""
+        try:
+            raw_bars = await self.client.get_futures_candlesticks(symbol, resolution="1")
+            if raw_bars and len(raw_bars) >= 30:
+                opens = np.array([float(b["open"]) for b in raw_bars])
+                highs = np.array([float(b["high"]) for b in raw_bars])
+                lows = np.array([float(b["low"]) for b in raw_bars])
+                closes = np.array([float(b["close"]) for b in raw_bars])
+                volumes = np.array([float(b.get("volume", 100.0)) for b in raw_bars])
+                
+                data = {
+                    "open": opens,
+                    "high": highs,
+                    "low": lows,
+                    "close": closes,
+                    "volume": volumes,
+                    "last_fetch": time.time(),
+                    "is_synthetic": False
+                }
+                self._candle_cache[symbol] = data
+                return data
+        except Exception as e:
+            logger.debug(f"Candlestick fetch error for {symbol}: {e}")
+        return None
+
+    def _create_fallback_candles(
+        self,
+        symbol: str,
+        current_price: float,
+        high_24h: float,
+        low_24h: float,
+        volume_24h: float,
+        change_24h: float
+    ) -> Dict[str, Any]:
+        """Neutral fallback when an instrument has no public candlestick history yet. Never used for live trade execution."""
+        n = 60
+        price_series = np.full(n, current_price)
+        highs = np.full(n, max(current_price, high_24h))
+        lows = np.full(n, min(current_price, low_24h))
+        opens = np.full(n, current_price)
+        volumes = np.full(n, max(100.0, volume_24h / 1440.0))
+        
+        data = {
+            "open": opens, "high": highs, "low": lows, "close": price_series, "volume": volumes,
+            "last_fetch": time.time(),
+            "is_synthetic": True  # Strictly gated from live order execution
+        }
+        self._candle_cache[symbol] = data
+        return data
+
     def _get_or_update_candles(
         self,
         symbol: str,
@@ -72,46 +124,12 @@ class MarketScreener:
         """Maintains high-frequency OHLCV arrays strictly anchored to real CoinDCX prices."""
         if symbol in self._candle_cache:
             data = self._candle_cache[symbol]
-            # Update latest bar with exact live tick
             data["close"][-1] = current_price
             data["high"][-1] = max(data["high"][-1], current_price)
             data["low"][-1] = min(data["low"][-1], current_price)
             return data
 
-        # Initialize 100 historical bars anchored to current real market price
-        n = 100
-        volatility = max(0.001, abs(high_24h - low_24h) / max(current_price, 1e-6) / 24.0)
-        returns = np.random.normal(0.0001, min(0.008, volatility), n)
-        returns[-1] = 0.0  # Ensure latest return doesn't deviate
-        
-        # Cumulative return series ending EXACTLY at current_price
-        cum_returns = np.cumsum(returns)
-        unscaled_series = 1.0 + cum_returns - cum_returns[-1]
-        price_series = current_price * unscaled_series
-        
-        # Clip within reasonable 24h range
-        safe_low = max(1e-6, low_24h * 0.98 if low_24h > 0 else current_price * 0.90)
-        safe_high = high_24h * 1.02 if high_24h > 0 else current_price * 1.10
-        price_series = np.clip(price_series, safe_low, safe_high)
-        price_series[-1] = current_price  # Guarantees exact live match with exchange!
-        
-        highs = np.maximum(price_series, np.roll(price_series, 1)) * (1.0 + np.abs(np.random.normal(0, volatility * 0.2, n)))
-        lows = np.minimum(price_series, np.roll(price_series, 1)) * (1.0 - np.abs(np.random.normal(0, volatility * 0.2, n)))
-        opens = np.roll(price_series, 1)
-        opens[0] = price_series[0]
-        
-        vol_per_bar = max(100.0, volume_24h / 1440.0)
-        volumes = np.random.uniform(vol_per_bar * 0.5, vol_per_bar * 1.5, n)
-
-        data = {
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": price_series,
-            "volume": volumes
-        }
-        self._candle_cache[symbol] = data
-        return data
+        return self._create_fallback_candles(symbol, current_price, high_24h, low_24h, volume_24h, change_24h)
 
     async def scan_and_filter_market(
         self,
@@ -119,11 +137,12 @@ class MarketScreener:
         filter_count: int = 100,
         execution_count: int = 10,
         min_volume_24h: float = 10000.0,
+        direction_bias: Optional[str] = "AUTO",
         custom_weights: Optional[Dict[str, float]] = None
     ) -> Dict[str, Any]:
         """
         Full 5-stage screening pipeline backed by 100% REAL CoinDCX live market data:
-        500 Universe -> 100 Filtered Liquid Pairs -> AI Scored & Ranked -> Top N Execution List.
+        500 Universe -> 100 Filtered Liquid Pairs -> 240 Real Candles -> AI Scored & Ranked -> Top N Execution List.
         """
         scan_start = time.perf_counter()
         
@@ -134,17 +153,16 @@ class MarketScreener:
         rt_data = await self.client.get_realtime_futures_prices()
         prices_map = rt_data.get("prices", {})
         
-        # If active_universe is empty or not in prices, take from prices_map
         if not self.raw_universe and prices_map:
             self.raw_universe = list(prices_map.keys())
 
-        active_universe = self.raw_universe[:universe_size]
-        
+        active_universe = list(prices_map.keys())[:universe_size] if prices_map else self.raw_universe[:universe_size]
+
         # Stage 1 & 2: Ingest REAL prices & Filter to Top Liquid Assets
         candidates = []
         for sym in active_universe:
             item = prices_map.get(sym)
-            if not item:
+            if not isinstance(item, dict):
                 continue
 
             latest_price = float(item.get("ls") or item.get("mp") or 0.0)
@@ -152,6 +170,9 @@ class MarketScreener:
                 continue
 
             vol_24h = float(item.get("v", 0.0))
+            if vol_24h < min_volume_24h:
+                continue
+
             high_24h = float(item.get("h", latest_price))
             low_24h = float(item.get("l", latest_price))
             change_24h = float(item.get("pc", 0.0))
@@ -162,39 +183,51 @@ class MarketScreener:
             if spread_pct <= 0.0001 or spread_pct > 2.0:
                 spread_pct = 0.02
                 
-            candles = self._get_or_update_candles(sym, latest_price, high_24h, low_24h, vol_24h, change_24h)
-            
             candidates.append({
                 "symbol": sym,
-                "price": round(latest_price, 4),
-                "volume_24h": round(vol_24h, 2),
-                "spread_pct": round(spread_pct, 4),
-                "change_24h": round(change_24h, 2),
-                "high_24h": round(high_24h, 4),
-                "low_24h": round(low_24h, 4),
-                "mark_price": round(mark_price, 4),
-                "candles": candles
+                "price": latest_price,
+                "volume_24h": vol_24h,
+                "spread_pct": spread_pct,
+                "change_24h": change_24h,
+                "high_24h": high_24h,
+                "low_24h": low_24h,
+                "mark_price": mark_price
             })
 
-        # Sort by volume and liquidity, take top filter_count (e.g. 100)
+        # Sort by volume and liquidity, take top filter_count (e.g. 50-100)
         candidates.sort(key=lambda x: x["volume_24h"], reverse=True)
         self.filtered_100 = candidates[:filter_count]
 
+        # Stage 2.5: Ingest Real Historical Candlesticks for Top Candidates
+        now_ts = time.time()
+        fetch_needed = [
+            c["symbol"] for c in self.filtered_100
+            if c["symbol"] not in self._candle_cache or (now_ts - self._candle_cache[c["symbol"]].get("last_fetch", 0) > 60.0)
+        ]
+        if fetch_needed:
+            batch = fetch_needed[:30]
+            fetch_tasks = [self._fetch_and_cache_candles(s) for s in batch]
+            await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
         # Stage 3 & 4: Compute 100+ Indicators and Run AI Model
+        fmt = AlphaAIEngine.format_price_precision
         ai_evaluated_list = []
         for c in self.filtered_100:
-            candles = c["candles"]
+            sym = c["symbol"]
+            candles = self._get_or_update_candles(
+                sym, c["price"], c["high_24h"], c["low_24h"], c["volume_24h"], c["change_24h"]
+            )
             
             # Orderbook with realistic depth tightly around real price
             best_p = c["price"]
             half_spread = max(best_p * 0.0001, best_p * (c["spread_pct"] / 200.0))
             ob = {
-                "bids": {str(round(best_p - half_spread * (i + 1), 4)): round(25.0 / (i + 1), 2) for i in range(5)},
-                "asks": {str(round(best_p + half_spread * (i + 1), 4)): round(22.0 / (i + 1), 2) for i in range(5)}
+                "bids": {str(fmt(best_p - half_spread * (i + 1))): round(25.0 / (i + 1), 2) for i in range(5)},
+                "asks": {str(fmt(best_p + half_spread * (i + 1))): round(22.0 / (i + 1), 2) for i in range(5)}
             }
             
-            # Compute 100+ indicators
-            features = AlphaIndicatorsEngine.compute_all_indicators(
+            # Compute 100+ Multi-Timeframe indicators (1m, 5m, 15m)
+            features = AlphaIndicatorsEngine.compute_multi_timeframe_indicators(
                 opens=candles["open"],
                 highs=candles["high"],
                 lows=candles["low"],
@@ -205,45 +238,69 @@ class MarketScreener:
             
             # Run AI Evaluation (< 200 microseconds)
             ai_res = self.ai_engine.evaluate_scalp_opportunity(
-                symbol=c["symbol"],
+                symbol=sym,
                 features=features,
                 orderbook=ob,
                 custom_weights=custom_weights
             )
+
+            # Strictly gate out assets without authentic historical candles
+            if candles.get("is_synthetic", False):
+                ai_res["signal"] = "NEUTRAL"
+                ai_res["confidence"] = 50.0
             
-            # Merge candidate data
+            # Merge candidate data with rich metrics
             merged = {
-                "symbol": c["symbol"],
-                "price": c["price"],
-                "volume_24h": c["volume_24h"],
-                "spread_pct": c["spread_pct"],
-                "change_24h": c.get("change_24h", 0.0),
-                "high_24h": c.get("high_24h", c["price"]),
-                "low_24h": c.get("low_24h", c["price"]),
-                "mark_price": c.get("mark_price", c["price"]),
+                "symbol": sym,
+                "price": fmt(c["price"]),
+                "volume_24h": round(c["volume_24h"], 2),
+                "spread_pct": round(c["spread_pct"], 4),
+                "change_24h": round(c["change_24h"], 2),
+                "high_24h": fmt(c["high_24h"]),
+                "low_24h": fmt(c["low_24h"]),
+                "mark_price": fmt(c["mark_price"]),
                 "signal": ai_res["signal"],
                 "confidence": ai_res["confidence"],
                 "regime": ai_res["regime"],
+                "entry_type": ai_res["entry_type"],
                 "entry_price": ai_res["entry_price"],
+                "market_price": ai_res["market_price"],
                 "tp1_price": ai_res["tp1_price"],
                 "tp2_price": ai_res["tp2_price"],
                 "sl_price": ai_res["sl_price"],
                 "breakeven_trigger": ai_res["breakeven_trigger"],
                 "breakeven_sl": ai_res["breakeven_sl"],
+                "risk_r": ai_res["risk_r"],
+                "rr_ratio": ai_res["rr_ratio"],
                 "latency_us": ai_res["latency_us"],
                 "vol_surge": ai_res["vol_surge"],
                 "obi_10": round(features.get("orderbook_imbalance_10", 0.0), 3),
                 "rsi_14": round(features.get("rsi_14", 50.0), 1),
-                "supertrend_bull": bool(features.get("supertrend_bullish", 0.0))
+                "supertrend_bull": bool(features.get("supertrend_bullish", 0.0)),
+                "candlestick_pattern": features.get("candlestick_pattern_score", 0.0),
+                "swing_high": fmt(features.get("swing_high_15", c["price"])),
+                "swing_low": fmt(features.get("swing_low_15", c["price"])),
+                "support_level": fmt(features.get("support_level", c["price"])),
+                "resistance_level": fmt(features.get("resistance_level", c["price"])),
+                "atr_pct": round(features.get("atr_pct", 0.5), 3)
             }
             ai_evaluated_list.append(merged)
 
-        # Sort by strongest conviction (deviation from 50% neutral)
-        ai_evaluated_list.sort(key=lambda x: abs(x["confidence"] - 50.0), reverse=True)
+        # Sort by strongest directional conviction (highest confidence in BUY or SELL)
+        ai_evaluated_list.sort(key=lambda x: x["confidence"], reverse=True)
         
+        # Apply direction bias filtering if specified
+        bias = (direction_bias or "AUTO").upper()
+        if bias == "LONG":
+            execution_pool = [x for x in ai_evaluated_list if "BUY" in x["signal"]]
+        elif bias == "SHORT":
+            execution_pool = [x for x in ai_evaluated_list if "SELL" in x["signal"]]
+        else:
+            execution_pool = ai_evaluated_list
+
         # Update state
         self.filtered_100 = ai_evaluated_list
-        self.ranked_execution_candidates = ai_evaluated_list[:execution_count]
+        self.ranked_execution_candidates = execution_pool[:execution_count]
         self.last_scan_timestamp = int(time.time() * 1000)
 
         elapsed_ms = round((time.perf_counter() - scan_start) * 1000.0, 2)

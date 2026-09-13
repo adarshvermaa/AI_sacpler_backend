@@ -43,20 +43,20 @@ class AlphaScalperSettings(BaseSettings):
     UNIVERSE_MAX_ASSETS: int = 500
     FILTER_TOP_CANDIDATES: int = 100
     MAX_ACTIVE_ORDERS: int = 50
-    DEFAULT_ACTIVE_ORDERS: int = 10
+    DEFAULT_ACTIVE_ORDERS: int = 1
     
     # Scalper Execution & Risk Control
     DEFAULT_LEVERAGE: float = 10.0
     MAX_LEVERAGE: float = 20.0
     MARGIN_MODE: str = "isolated"  # "isolated" or "crossed"
-    MARGIN_CURRENCY: str = "USDT"  # "USDT" or "INR"
+    MARGIN_CURRENCY: str = "INR"   # "INR" for CoinDCX India accounts, or "USDT"
     
     # "Win-Win" Strategy Parameters
     TP1_RATIO: float = 0.0035       # +0.35% Take Profit 1 (Closes 50% & ratchets SL to Breakeven)
     TP2_RATIO: float = 0.0085       # +0.85% Take Profit 2 (Target runner)
     HARD_SL_RATIO: float = 0.0045   # -0.45% Emergency Stop Loss
-    FEE_BUFFER: float = 0.0006      # +0.06% buffer over entry price to guarantee net profit after fees
-    MICRO_TIMEOUT_SECONDS: int = 30 # Auto-exit if trade doesn't hit TP1 within 30s
+    FEE_BUFFER: float = 0.0015      # +0.15% buffer over entry price to guarantee net profit after CoinDCX taker fees (0.10%) and GST (0.018%)
+    MICRO_TIMEOUT_SECONDS: int = 600 # 10 minutes to allow scalp to reach TP1 and clear fees (eliminates 30s churn)
     OBI_FLIP_EXIT: bool = True      # Exit immediately if orderbook imbalance turns hostile
     
     # Capital Allocation & Risk Limits

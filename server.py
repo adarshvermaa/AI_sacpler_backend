@@ -50,6 +50,7 @@ engine_state = {
     "execution_count": settings.DEFAULT_ACTIVE_ORDERS,
     "leverage": settings.DEFAULT_LEVERAGE,
     "risk_per_trade_pct": settings.MAX_RISK_PER_TRADE_PERCENT,
+    "direction_bias": "AUTO",  # "AUTO", "LONG", or "SHORT"
     "selected_indicators": ["RSI", "VWAP", "Bollinger", "SuperTrend", "OBI", "MACD"],
     "price_action_rules": ["OrderBlocks", "FVG", "LiquiditySweeps"],
     "latency_history": []
@@ -99,21 +100,27 @@ async def scalper_orchestrator_loop():
                 scan_res = await screener.scan_and_filter_market(
                     universe_size=engine_state["universe_size"],
                     filter_count=engine_state["filter_count"],
-                    execution_count=engine_state["execution_count"]
+                    execution_count=engine_state["execution_count"],
+                    direction_bias=engine_state.get("direction_bias", "AUTO")
                 )
 
-                # 2. Check for actionable scalps on top candidates
+                # 2. Check for actionable scalps on top candidates (both BUY and SELL)
                 for candidate in scan_res.get("ranked_targets", []):
-                    # In default mode or custom mode, execute if high confidence
-                    if candidate["confidence"] >= 72.0 or candidate["confidence"] <= 28.0:
+                    # Execute high-conviction signals (>= 78% confidence, requires MTF confirmation)
+                    sig = candidate.get("signal", "NEUTRAL")
+                    if candidate.get("confidence", 0.0) >= 78.0 and ("BUY" in sig or "SELL" in sig):
                         symbol = candidate["symbol"]
                         
                         # Avoid duplicate trade on same symbol
                         already_open = any(t.symbol == symbol for t in execution_engine.active_trades.values())
                         if not already_open and len(execution_engine.active_trades) < engine_state["execution_count"]:
-                            # Size position using Kelly Criterion
-                            pos_size = risk_manager.calculate_kelly_position_size(candidate["confidence"])
-                            can_trade, reason = risk_manager.can_open_new_trade(pos_size)
+                            current_lev = float(engine_state.get("leverage", settings.DEFAULT_LEVERAGE))
+                            # Size position using Fractional Kelly Criterion scaled by leverage
+                            pos_size = risk_manager.calculate_kelly_position_size(
+                                candidate["confidence"],
+                                leverage=current_lev
+                            )
+                            can_trade, reason = risk_manager.can_open_new_trade(pos_size, leverage=current_lev, symbol=symbol)
                             
                             if can_trade:
                                 trade = await execution_engine.execute_win_win_entry(
@@ -125,9 +132,10 @@ async def scalper_orchestrator_loop():
                                     sl_price=candidate["sl_price"],
                                     breakeven_sl=candidate["breakeven_sl"],
                                     allocated_usdt=pos_size,
-                                    leverage=engine_state["leverage"]
+                                    leverage=current_lev
                                 )
                                 if trade:
+                                    risk_manager.record_trade_entry(symbol)
                                     await broadcast_event("execution_event", {
                                         "type": "ENTRY",
                                         "trade_id": trade.trade_id,
@@ -135,33 +143,79 @@ async def scalper_orchestrator_loop():
                                         "side": trade.side,
                                         "price": trade.entry_price,
                                         "size_usdt": pos_size,
-                                        "message": f"Executed {trade.side} Scalp on {symbol} @ ${trade.entry_price}"
+                                        "leverage": current_lev,
+                                        "message": f"Executed {trade.side} Scalp on {symbol} @ ${trade.entry_price} (AI Signal: {sig}, Conviction: {candidate['confidence']}%, Leverage: {current_lev}x)"
                                     })
                             else:
-                                # Throttle Balance Guard notification to prevent spamming
-                                if "BALANCE GUARD" in reason:
+                                # Throttle Cooldown / Guard notification to prevent spamming
+                                if "COOLDOWN" in reason or "BALANCE GUARD" in reason or "PACING" in reason:
                                     now_ts = time.time()
-                                    if now_ts - engine_state.get("_last_guard_broadcast", 0.0) > 20.0:
+                                    if now_ts - engine_state.get("_last_guard_broadcast", 0.0) > 30.0:
                                         engine_state["_last_guard_broadcast"] = now_ts
                                         await broadcast_event("execution_event", {
-                                            "type": "BALANCE_GUARD_HOLD",
+                                            "type": "PACING_GUARD_HOLD",
                                             "symbol": symbol,
-                                            "message": f"[BALANCE GUARD] AI Scalp signal ({candidate['signal']}) spotted on {symbol}, but order held. Balance (${risk_manager.current_capital:.4f} USDT) < Min $6.00 USDT."
+                                            "message": f"[AI GUARD] Scalp signal on {symbol} held: {reason}"
                                         })
 
-                # 3. Simulate or update price movements on active trades
-                for symbol, trade in list(execution_engine.active_trades.items()):
-                    # Get latest price or drift slightly in paper mode
-                    curr_p = screener._candle_cache.get(trade.symbol, {}).get("close", [trade.entry_price])[-1]
-                    events = execution_engine.update_ticks(trade.symbol, float(curr_p), obi_10=0.2)
+                # 3. Simulate or update price movements on active trades using live ticks
+                for trade_id, trade in list(execution_engine.active_trades.items()):
+                    cand = next((c for c in screener.filtered_100 if c["symbol"] == trade.symbol), None)
+                    curr_p = cand["price"] if cand else screener._candle_cache.get(trade.symbol, {}).get("close", [trade.entry_price])[-1]
+                    live_obi = float(cand.get("obi_10", 0.0)) if cand else 0.0
+                    events = execution_engine.update_ticks(trade.symbol, float(curr_p), obi_10=live_obi)
                     for ev in events:
-                        # Ensure real position is flattened on CoinDCX if in live mode
-                        if not client.is_paper and ev.get("event") in ("WIN_WIN_TP2_MAX_PROFIT", "STOP_EXECUTED", "MICRO_TIMEOUT_SCRATCH_EXIT"):
-                            try:
-                                await client.exit_futures_position(trade.symbol)
-                            except Exception as exit_err:
-                                logger.error(f"Error executing live position exit on CoinDCX for {trade.symbol}: {exit_err}")
-                        risk_manager.update_daily_pnl(ev.get("realized_pnl", 0.0))
+                        ev_type = ev.get("event")
+                        # Ensure real position is updated/flattened on CoinDCX if in live mode
+                        if not client.is_paper:
+                            if ev_type == "WIN_WIN_BREAKEVEN_LOCKED":
+                                try:
+                                    # 1. If half-size meets CoinDCX minimum notional ($6.00), scale out 50%
+                                    half_qty = float(ev.get("half_closed_qty", 0.0))
+                                    half_notional = half_qty * float(curr_p)
+                                    if half_notional >= 6.0:
+                                        exit_side = "sell" if trade.side.upper() == "BUY" else "buy"
+                                        await client.create_futures_order(
+                                            pair=trade.symbol,
+                                            side=exit_side,
+                                            order_type="market_order",
+                                            total_quantity=half_qty,
+                                            leverage=trade.leverage
+                                        )
+                                        logger.info(f"[LIVE SYNC] Scaled out 50% ({half_qty}) on CoinDCX for {trade.symbol} @ ${curr_p}")
+                                    
+                                    # 2. Ratchet exchange SL to Breakeven & TP to TP2
+                                    await client.cancel_all_open_orders_for_position(trade.symbol)
+                                    await client.create_futures_tpsl(
+                                        position_id=trade.symbol,
+                                        tp_stop_price=trade.tp2_price,
+                                        sl_stop_price=trade.breakeven_sl
+                                    )
+                                    logger.info(f"[LIVE SYNC] Ratcheted exchange SL on CoinDCX for {trade.symbol} to Breakeven: {trade.breakeven_sl}")
+                                except Exception as be_err:
+                                    logger.error(f"Error synchronizing Breakeven SL on CoinDCX for {trade.symbol}: {be_err}")
+                                    
+                            elif ev_type in ("WIN_WIN_TP2_MAX_PROFIT", "STOP_EXECUTED", "MICRO_TIMEOUT_SCRATCH_EXIT"):
+                                try:
+                                    await client.exit_futures_position(trade.symbol)
+                                except Exception as exit_err:
+                                    logger.error(f"Error executing live position exit on CoinDCX for {trade.symbol}: {exit_err}")
+                                
+                                # Enforce structure cooldown on the symbol after exit
+                                risk_manager.record_trade_exit(trade.symbol)
+
+                                # Immediately re-sync real CoinDCX INR wallet balance
+                                try:
+                                    wallet_info = await client.get_futures_inr_balance()
+                                    if wallet_info and wallet_info.get("total_inr", 0.0) > 0:
+                                        risk_manager.sync_live_inr_equity(wallet_info["total_inr"])
+                                except Exception as sync_err:
+                                    logger.debug(f"Live balance re-sync error: {sync_err}")
+                                    
+                        if ev_type in ("WIN_WIN_TP2_MAX_PROFIT", "STOP_EXECUTED", "MICRO_TIMEOUT_SCRATCH_EXIT"):
+                            risk_manager.record_trade_exit(trade.symbol)
+
+                        risk_manager.update_daily_pnl(ev.get("net_realized_pnl", ev.get("realized_pnl", 0.0)))
                         await broadcast_event("execution_event", ev)
 
                 # 4. Broadcast real-time telemetry to Next.js frontend
@@ -171,6 +225,12 @@ async def scalper_orchestrator_loop():
                     engine_state["latency_history"].pop(0)
 
                 stats = execution_engine.get_summary_stats()
+                inr_rate = 87.5
+                daily_pnl_usdt = round(risk_manager.daily_pnl, 2)
+                daily_pnl_inr = round(daily_pnl_usdt * inr_rate, 2)
+                capital_usdt = round(risk_manager.current_capital, 2)
+                capital_inr = round(capital_usdt * inr_rate, 2)
+
                 telemetry = {
                     "timestamp": int(time.time() * 1000),
                     "is_running": engine_state["is_running"],
@@ -178,8 +238,14 @@ async def scalper_orchestrator_loop():
                     "trading_mode": settings.TRADING_MODE,
                     "latency_ms": loop_latency_ms,
                     "avg_latency_ms": round(sum(engine_state["latency_history"]) / len(engine_state["latency_history"]), 2),
-                    "daily_pnl": round(risk_manager.daily_pnl, 2),
-                    "current_capital": round(risk_manager.current_capital, 4),
+                    "daily_pnl": daily_pnl_usdt,
+                    "daily_pnl_inr": daily_pnl_inr,
+                    "current_capital": capital_usdt,
+                    "current_capital_inr": capital_inr,
+                    "inr_rate": inr_rate,
+                    "total_fees_paid": stats.get("total_fees_paid", 0.0),
+                    "total_fees_paid_inr": round(stats.get("total_fees_paid", 0.0) * inr_rate, 2),
+                    "net_pnl": stats.get("net_pnl", daily_pnl_usdt),
                     "is_balance_sufficient": risk_manager.is_balance_sufficient,
                     "min_required_margin": risk_manager.min_order_notional,
                     "win_rate_pct": stats["win_rate_pct"],
@@ -188,6 +254,7 @@ async def scalper_orchestrator_loop():
                     "active_trades_count": stats["active_trades_count"],
                     "risk_free_count": stats["risk_free_active_count"],
                     "kill_switch_active": risk_manager.is_kill_switch_active,
+                    "circuit_breaker_tripped": risk_manager.is_circuit_breaker_tripped,
                     "top_ranked": scan_res.get("ranked_targets", [])[:5],
                     "filtered_100_summary": [
                         {
@@ -228,6 +295,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Authenticated Auth API:   {verification['auth_api']}")
     logger.info(f"Active Futures Contracts: {verification.get('active_instruments_count', 0)}")
     logger.info(f"Live Balances:            {verification.get('balances', {})}")
+    logger.info(f"Futures INR Wallet:       ₹{verification.get('futures_inr_balance', 0.0):.2f} INR (Available: ₹{verification.get('futures_inr_available', 0.0):.2f}, Locked: ₹{verification.get('futures_inr_locked', 0.0):.2f})")
     logger.info(f"Total Usable USDT Margin: ${verification.get('total_usdt_balance', 0.0):.4f} USDT")
     logger.info(f"Sufficient for Live Exec: {verification.get('is_balance_sufficient', False)} (Min required: ${verification.get('min_required_usdt', 6.0):.2f})")
     logger.info(f"Strategy Status:          {verification.get('strategy_status', 'UNKNOWN')}")
@@ -283,6 +351,11 @@ async def raw_websocket_endpoint(websocket: WebSocket):
     try:
         # Send initial state immediately
         stats = execution_engine.get_summary_stats()
+        stats["daily_pnl"] = round(risk_manager.daily_pnl, 2)
+        stats["daily_pnl_inr"] = round(risk_manager.daily_pnl * 87.5, 2)
+        stats["current_capital"] = round(risk_manager.current_capital, 2)
+        stats["current_capital_inr"] = round(risk_manager.current_capital * 87.5, 2)
+        stats["inr_rate"] = 87.5
         await websocket.send_text(json.dumps({
             "event": "initial_state",
             "data": {
@@ -318,6 +391,11 @@ async def raw_websocket_endpoint(websocket: WebSocket):
 async def connect(sid, environ):
     logger.info(f"Socket.IO Frontend Client connected: {sid}")
     stats = execution_engine.get_summary_stats()
+    stats["daily_pnl"] = round(risk_manager.daily_pnl, 2)
+    stats["daily_pnl_inr"] = round(risk_manager.daily_pnl * 87.5, 2)
+    stats["current_capital"] = round(risk_manager.current_capital, 2)
+    stats["current_capital_inr"] = round(risk_manager.current_capital * 87.5, 2)
+    stats["inr_rate"] = 87.5
     await sio.emit("initial_state", {
         "is_running": engine_state["is_running"],
         "mode": engine_state["mode"],
@@ -342,8 +420,23 @@ class StrategyConfigRequest(BaseModel):
     execution_count: int = 10
     leverage: float = 10.0
     risk_per_trade_pct: float = 1.0
+    direction_bias: Optional[str] = "AUTO"  # "AUTO", "LONG", or "SHORT"
     selected_indicators: Optional[List[str]] = None
     price_action_rules: Optional[List[str]] = None
+
+
+class CreateOrderRequest(BaseModel):
+    pair: str
+    side: str = "buy"  # "buy" or "sell"
+    order_type: str = "market_order"
+    quantity: Optional[float] = None
+    notional: Optional[float] = 6.0
+    leverage: Optional[float] = None
+    price: Optional[float] = None
+    tp_price: Optional[float] = None
+    sl_price: Optional[float] = None
+    tp2_price: Optional[float] = None
+
 
 
 @fastapi_app.get("/api/v1/health")
@@ -444,12 +537,13 @@ async def configure_strategy(req: StrategyConfigRequest):
     engine_state["execution_count"] = req.execution_count
     engine_state["leverage"] = req.leverage
     engine_state["risk_per_trade_pct"] = req.risk_per_trade_pct
+    engine_state["direction_bias"] = (req.direction_bias or "AUTO").upper()
     if req.selected_indicators:
         engine_state["selected_indicators"] = req.selected_indicators
     if req.price_action_rules:
         engine_state["price_action_rules"] = req.price_action_rules
 
-    logger.info(f"Updated Strategy Configuration: Mode={engine_state['mode']}, Universe={req.universe_size}, Filter={req.filter_count}, Exec={req.execution_count}")
+    logger.info(f"Updated Strategy Configuration: Mode={engine_state['mode']}, Bias={engine_state['direction_bias']}, Universe={req.universe_size}, Filter={req.filter_count}, Exec={req.execution_count}")
     return {"status": "success", "config": engine_state}
 
 
@@ -458,7 +552,8 @@ async def get_screener_results():
     scan_res = await screener.scan_and_filter_market(
         universe_size=engine_state["universe_size"],
         filter_count=engine_state["filter_count"],
-        execution_count=engine_state["execution_count"]
+        execution_count=engine_state["execution_count"],
+        direction_bias=engine_state.get("direction_bias", "AUTO")
     )
     return scan_res
 
@@ -474,47 +569,426 @@ async def get_live_orderbook(symbol: str = "B-BTC_USDT"):
 
 @fastapi_app.get("/api/v1/positions")
 async def get_positions():
-    trades = [
-        {
-            "trade_id": t.trade_id,
-            "symbol": t.symbol,
-            "side": t.side,
-            "entry_price": t.entry_price,
-            "tp1_price": t.tp1_price,
-            "tp2_price": t.tp2_price,
-            "sl_price": t.sl_price,
-            "breakeven_sl": t.breakeven_sl,
-            "is_risk_free": t.is_risk_free,
-            "remaining_qty": round(t.remaining_qty, 4),
-            "unrealized_pnl": round(t.unrealized_pnl, 2),
-            "realized_pnl": round(t.realized_pnl, 2),
-            "state": t.current_state,
-            "elapsed_seconds": int(time.time() - (t.entry_time or time.time()))
-        }
-        for t in execution_engine.active_trades.values()
-    ]
+    """
+    Returns all active positions synced directly with live CoinDCX exchange.
+    Includes entry price, live mark price, liquidation price, TP, SL, and PnL in both INR and USDT.
+    """
+    trades = []
+    seen_symbols = set()
+
+    # 1. Query live CoinDCX exchange positions
+    if not client.is_paper:
+        try:
+            live_pos = await client.get_futures_positions()
+            for p in live_pos:
+                sym = p.get("pair")
+                seen_symbols.add(sym)
+                trades.append({
+                    "trade_id": p.get("id"),
+                    "position_id": p.get("id"),
+                    "symbol": sym,
+                    "side": p.get("side", "BUY"),
+                    "entry_price": p.get("entry_price", 0.0),
+                    "mark_price": p.get("mark_price", 0.0),
+                    "liquidation_price": float(p.get("liquidation_price") or 0.0),
+                    "tp1_price": p.get("tp_price"),
+                    "sl_price": p.get("sl_price"),
+                    "is_risk_free": p.get("tp_price") is not None,
+                    "remaining_qty": p.get("abs_quantity", 0.0),
+                    "unrealized_pnl": p.get("unrealized_pnl_usdt", 0.0),
+                    "unrealized_pnl_inr": p.get("unrealized_pnl_inr", 0.0),
+                    "roe_percent": p.get("roe_percent", 0.0),
+                    "locked_margin_usdt": p.get("locked_margin_usdt", 0.0),
+                    "locked_margin_inr": p.get("locked_margin_inr", 0.0),
+                    "leverage": float(p.get("leverage") or 10.0),
+                    "state": "LIVE_OPEN",
+                    "is_live": True,
+                    "elapsed_seconds": 0
+                })
+        except Exception as e:
+            logger.error(f"Error fetching live positions from CoinDCX: {e}")
+
+    # 2. Also merge any in-memory trades that haven't appeared on exchange or paper trades
+    for t in execution_engine.active_trades.values():
+        if t.symbol not in seen_symbols:
+            trades.append({
+                "trade_id": t.trade_id,
+                "position_id": t.trade_id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "entry_price": t.entry_price,
+                "mark_price": t.entry_price,
+                "liquidation_price": 0.0,
+                "tp1_price": t.tp1_price,
+                "tp2_price": t.tp2_price,
+                "sl_price": t.sl_price,
+                "breakeven_sl": t.breakeven_sl,
+                "is_risk_free": t.is_risk_free,
+                "remaining_qty": round(t.remaining_qty, 4),
+                "unrealized_pnl": round(t.unrealized_pnl, 4),
+                "unrealized_pnl_inr": round(t.unrealized_pnl * 87.5, 2),
+                "roe_percent": round(getattr(t, "roe_pct", 0.0), 2),
+                "locked_margin_usdt": round(t.remaining_qty * t.entry_price / max(1.0, t.leverage), 4),
+                "locked_margin_inr": round(t.remaining_qty * t.entry_price / max(1.0, t.leverage) * 87.5, 2),
+                "leverage": t.leverage,
+                "state": t.current_state,
+                "is_live": not client.is_paper,
+                "elapsed_seconds": int(time.time() - (t.entry_time or time.time()))
+            })
+
     return {"active_trades": trades, "count": len(trades)}
 
 
 @fastapi_app.post("/api/v1/positions/exit")
 async def exit_single_position(payload: Dict[str, str]):
-    trade_id = payload.get("trade_id")
-    if trade_id in execution_engine.active_trades:
-        trade = execution_engine.active_trades.pop(trade_id)
+    """
+    Exits a specific position on CoinDCX and removes it from in-memory engine.
+    Accepts trade_id, symbol, or exchange position UUID.
+    """
+    target = payload.get("trade_id") or payload.get("symbol") or payload.get("id")
+    if not target:
+        return {"status": "error", "message": "Missing position identifier"}
+
+    # 1. Close on exchange
+    res = await client.exit_futures_position(target)
+    
+    # 2. Also remove from execution_engine active_trades
+    for tid, trade in list(execution_engine.active_trades.items()):
+        if tid == target or trade.symbol == target:
+            trade.remaining_qty = 0.0
+            execution_engine.closed_trades.append(trade)
+            execution_engine.active_trades.pop(tid, None)
+            break
+
+    await broadcast_event("execution_event", {
+        "type": "POSITION_EXITED",
+        "message": f"Position on {target} exited successfully."
+    })
+    return {"status": "success", "target": target, "exchange_response": res}
+
+
+@fastapi_app.post("/api/v1/positions/exit_all")
+async def exit_all_positions():
+    """
+    Exits and liquidates all active positions both in memory and on the live exchange.
+    """
+    exited_trades = []
+    # 1. Cancel all open/untriggered orders on exchange first
+    if not client.is_paper:
+        try:
+            await client.cancel_all_futures_open_orders(["INR", "USDT"])
+            logger.info("Cancelled all open futures orders during exit_all")
+        except Exception as e:
+            logger.warning(f"Note on cancelling open orders during exit_all: {e}")
+
+    # 2. Exit in-memory trades
+    for trade_id, trade in list(execution_engine.active_trades.items()):
         await client.exit_futures_position(trade.symbol)
         trade.remaining_qty = 0.0
         execution_engine.closed_trades.append(trade)
-        return {"status": "success", "trade_id": trade_id}
-    return {"status": "not_found"}
+        exited_trades.append(trade.symbol)
+    execution_engine.active_trades.clear()
+
+    # 3. Exit any live exchange positions
+    if not client.is_paper:
+        try:
+            live_positions = await client.get_futures_positions()
+            for p in live_positions:
+                if abs(float(p.get("active_pos", 0.0))) > 1e-6:
+                    sym = p.get("pair")
+                    pos_id = p.get("id")
+                    await client.exit_futures_position(pos_id or sym)
+                    if sym not in exited_trades:
+                        exited_trades.append(sym)
+        except Exception as e:
+            logger.error(f"Error checking live positions during exit_all: {e}")
+
+    await broadcast_event("execution_event", {
+        "type": "EXIT_ALL",
+        "message": f"Exit All executed: All open positions flattened and all active orders cancelled ({len(exited_trades)} positions closed)."
+    })
+    return {"status": "success", "closed_count": len(exited_trades), "symbols": exited_trades}
+
+
+@fastapi_app.get("/api/v1/orders/active")
+async def get_active_orders_endpoint():
+    """
+    Fetches all open and untriggered orders from CoinDCX (Futures TP/SL & Spot orders).
+    """
+    try:
+        orders = await client.get_all_active_orders()
+        return {"status": "success", "orders": orders, "count": len(orders)}
+    except Exception as e:
+        logger.error(f"Error in get_active_orders: {e}")
+        return {"status": "error", "message": str(e), "orders": [], "count": 0}
+
+
+@fastapi_app.post("/api/v1/orders/cancel")
+async def cancel_order_endpoint(payload: Dict[str, Any]):
+    """
+    Cancels a specific active order on CoinDCX (supports both Futures UUIDs and Spot numeric IDs).
+    """
+    order_id = payload.get("order_id") or payload.get("id")
+    if not order_id:
+        return {"status": "error", "message": "Missing order_id"}
+
+    res = await client.cancel_any_order(str(order_id))
+    await broadcast_event("execution_event", {
+        "type": "ORDER_CANCELLED",
+        "message": f"Order {order_id} cancelled on CoinDCX."
+    })
+    return {"status": "success", "order_id": order_id, "response": res}
+
+
+@fastapi_app.post("/api/v1/orders/cancel_all")
+async def cancel_all_orders_endpoint():
+    """
+    Cancels ALL open and untriggered orders across Futures and Spot on CoinDCX.
+    """
+    fut_res = {}
+    spot_res = {}
+    if not client.is_paper:
+        try:
+            fut_res = await client.cancel_all_futures_open_orders(["INR", "USDT"])
+        except Exception as e:
+            fut_res = {"error": str(e)}
+        try:
+            spot_res = await client.cancel_all_spot_orders("USDTINR")
+        except Exception as e:
+            spot_res = {"error": str(e)}
+
+    await broadcast_event("execution_event", {
+        "type": "ALL_ORDERS_CANCELLED",
+        "message": "All open and untriggered orders cancelled across CoinDCX."
+    })
+    return {
+        "status": "success",
+        "futures_response": fut_res,
+        "spot_response": spot_res
+    }
+
+
+@fastapi_app.post("/api/v1/orders/status_multiple")
+async def get_multiple_orders_status_endpoint(payload: Dict[str, Any]):
+    """
+    Queries status of multiple orders via CoinDCX status_multiple endpoint.
+    """
+    ids = payload.get("ids", [])
+    client_ids = payload.get("client_order_ids", [])
+    res = await client.get_multiple_spot_order_status(ids=ids, client_order_ids=client_ids)
+    return {"status": "success", "orders": res}
+
+
+@fastapi_app.post("/api/v1/orders/create")
+async def create_order_endpoint(req: CreateOrderRequest):
+    """
+    Creates a new futures order, attaches Take Profit & Stop Loss triggers on CoinDCX,
+    and registers the trade in the real-time position manager.
+    """
+    target_lev = req.leverage or engine_state.get("leverage", settings.DEFAULT_LEVERAGE)
+    target_notional = req.notional or 6.0
+    
+    # Fetch current market price for pair if not provided
+    current_price = req.price
+    if not current_price:
+        try:
+            ob = await client.get_futures_orderbook(req.pair, depth=1)
+            bids = ob.get("bids", [])
+            asks = ob.get("asks", [])
+            if req.side.lower() == "buy" and asks:
+                current_price = float(asks[0][0])
+            elif bids:
+                current_price = float(bids[0][0])
+            else:
+                current_price = 1.0
+        except Exception:
+            current_price = 1.0
+
+    # Sanitize order parameters to match CoinDCX step size & min notional
+    safe_qty, safe_lev, actual_notional = await client.sanitize_order_params(
+        pair=req.pair,
+        target_notional=target_notional,
+        desired_leverage=target_lev,
+        price=current_price
+    )
+    req_margin = actual_notional / max(1.0, float(safe_lev))
+    
+    if req.quantity is not None and req.quantity > 0:
+        safe_qty = req.quantity
+
+    # Balance guard
+    if not client.is_paper:
+        usable = await client.get_usable_balance_usdt()
+        if usable < req_margin:
+            return {
+                "status": "error",
+                "message": f"Insufficient margin: Required ${req_margin:.2f} USDT, available ${usable:.4f} USDT"
+            }
+
+    await client.update_position_leverage(req.pair, safe_lev)
+    
+    # Dynamic TP & SL targets with intelligent price precision
+    fmt = AlphaAIEngine.format_price_precision
+    is_buy = req.side.lower() == "buy"
+    if req.tp_price and req.tp_price > 0:
+        tp1_price = fmt(req.tp_price)
+    else:
+        tp1_price = fmt(current_price * (1.0 + (settings.TP1_RATIO if is_buy else -settings.TP1_RATIO)))
+
+    if req.sl_price and req.sl_price > 0:
+        sl_price = fmt(req.sl_price)
+    else:
+        sl_price = fmt(current_price * (1.0 - (settings.HARD_SL_RATIO if is_buy else -settings.HARD_SL_RATIO)))
+
+    if req.tp2_price and req.tp2_price > 0:
+        tp2_price = fmt(req.tp2_price)
+    else:
+        tp2_price = fmt(current_price * (1.0 + (settings.TP2_RATIO if is_buy else -settings.TP2_RATIO)))
+
+    be_sl = fmt(current_price * (1.0 + (settings.FEE_BUFFER if is_buy else -settings.FEE_BUFFER)))
+
+    # 1. Place the order
+    order_res = await client.create_futures_order(
+        pair=req.pair,
+        side=req.side,
+        order_type=req.order_type,
+        total_quantity=safe_qty,
+        price=req.price,
+        leverage=safe_lev
+    )
+
+    # 2. Attach TP & SL triggers on CoinDCX
+    tpsl_res = None
+    try:
+        tpsl_res = await client.create_futures_tpsl(
+            position_id=req.pair,
+            tp_stop_price=tp1_price,
+            sl_stop_price=sl_price
+        )
+    except Exception as e:
+        logger.warning(f"Note on attaching TP/SL: {e}")
+
+    # 3. Register in internal execution engine
+    trade_id = f"ORDER-{int(time.time()*1000)}-{req.pair}"
+    from win_win_strategy import WinWinTrade, WinWinOrderState
+    new_trade = WinWinTrade(
+        trade_id=trade_id,
+        symbol=req.pair,
+        side=req.side.upper(),
+        total_size_usdt=actual_notional,
+        entry_price=current_price,
+        tp1_price=tp1_price,
+        tp2_price=tp2_price,
+        sl_price=sl_price,
+        breakeven_sl=be_sl,
+        leverage=safe_lev
+    )
+    new_trade.filled_qty = safe_qty
+    new_trade.remaining_qty = safe_qty
+    new_trade.entry_time = time.time()
+    new_trade.current_state = WinWinOrderState.TIER1_FILLED
+    execution_engine.active_trades[trade_id] = new_trade
+
+    await broadcast_event("execution_event", {
+        "type": "ORDER_PLACED_WITH_TPSL",
+        "message": f"Order placed on {req.pair} ({req.side.upper()} {safe_qty}) with TP: ${tp1_price} and SL: ${sl_price}"
+    })
+    
+    return {
+        "status": "success",
+        "order": order_res,
+        "tpsl": tpsl_res,
+        "symbol": req.pair,
+        "quantity": safe_qty,
+        "entry_price": current_price,
+        "tp1_price": tp1_price,
+        "sl_price": sl_price,
+        "leverage": safe_lev,
+        "margin_required": req_margin
+    }
+
+
+@fastapi_app.get("/api/v1/risk/dynamic_allocation")
+async def get_dynamic_risk_allocation():
+    """
+    Computes mathematical dynamic order allocation and capital protection metrics
+    based on live CoinDCX Futures INR balance, equity tiers, and market volatility.
+    """
+    fut_info = await client.get_futures_inr_balance()
+    eq_usdt = fut_info.get("total_usdt_equiv", 0.0)
+    free_usdt = fut_info.get("available_usdt_equiv", 0.0)
+    
+    if client.is_paper:
+        eq_usdt = risk_manager.current_capital
+        free_usdt = eq_usdt * 0.9
+
+    allocation = risk_manager.compute_dynamic_order_allocation(
+        total_equity_usdt=eq_usdt,
+        free_margin_usdt=free_usdt,
+        current_atr_pct=0.005,
+        ai_confidence=78.0
+    )
+    allocation["futures_inr_wallet"] = fut_info
+    return allocation
 
 
 @fastapi_app.get("/api/v1/analytics/stats")
 async def get_analytics():
     stats = execution_engine.get_summary_stats()
-    stats["capital"] = round(risk_manager.current_capital, 2)
+    capital_usdt = round(risk_manager.current_capital, 2)
+    capital_inr = round(risk_manager.current_capital * 87.5, 2)
+    stats["capital"] = capital_usdt
+    stats["current_capital"] = capital_usdt
+    stats["capital_inr"] = capital_inr
+    stats["current_capital_inr"] = capital_inr
     stats["daily_pnl"] = round(risk_manager.daily_pnl, 2)
+    stats["daily_pnl_inr"] = round(risk_manager.daily_pnl * 87.5, 2)
+    stats["inr_rate"] = 87.5
     stats["latency_history"] = engine_state["latency_history"]
     return stats
+
+
+@fastapi_app.post("/api/v1/stats/reset")
+async def reset_stats_endpoint():
+    """
+    Resets in-memory trade history, win-rate, and daily PnL tracker.
+    Provides a clean slate for real account tracking.
+    """
+    execution_engine.reset_stats()
+    risk_manager.reset_daily_pnl()
+    risk_manager.symbol_cooldowns.clear()
+    logger.info("AlphaScalper performance statistics, cooldowns, and daily PnL reset to 0.")
+    
+    inr_rate = 87.5
+    capital_usdt = round(risk_manager.current_capital, 2)
+    capital_inr = round(capital_usdt * inr_rate, 2)
+    
+    reset_telemetry = {
+        "timestamp": int(time.time() * 1000),
+        "is_running": engine_state["is_running"],
+        "mode": engine_state["mode"],
+        "trading_mode": settings.TRADING_MODE,
+        "latency_ms": 0.18,
+        "avg_latency_ms": 0.18,
+        "daily_pnl": 0.0,
+        "daily_pnl_inr": 0.0,
+        "current_capital": capital_usdt,
+        "current_capital_inr": capital_inr,
+        "inr_rate": inr_rate,
+        "total_fees_paid": 0.0,
+        "total_fees_paid_inr": 0.0,
+        "net_pnl": 0.0,
+        "is_balance_sufficient": risk_manager.is_balance_sufficient,
+        "min_required_margin": risk_manager.min_order_notional,
+        "win_rate_pct": 0.0,
+        "profit_factor": 0.0,
+        "total_trades": 0,
+        "active_trades_count": len(execution_engine.active_trades),
+        "risk_free_count": 0,
+        "kill_switch_active": risk_manager.is_kill_switch_active
+    }
+    await broadcast_event("telemetry_update", reset_telemetry)
+    return {"status": "success", "message": "Performance statistics reset.", "stats": reset_telemetry}
 
 
 # ==========================================
