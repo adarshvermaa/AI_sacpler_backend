@@ -40,10 +40,10 @@ class AlphaScalperSettings(BaseSettings):
     ]
     
     # Screener & Scanner Settings
-    UNIVERSE_MAX_ASSETS: int = 500
-    FILTER_TOP_CANDIDATES: int = 100
-    MAX_ACTIVE_ORDERS: int = 50
-    DEFAULT_ACTIVE_ORDERS: int = 1
+    UNIVERSE_MAX_ASSETS: int = 1500  # Total available perpetual futures assets
+    FILTER_TOP_CANDIDATES: int = 10  # Strictly Top 10 high-probability profit candidates
+    MAX_ACTIVE_ORDERS: int = 10
+    DEFAULT_ACTIVE_ORDERS: int = 10
     
     # Scalper Execution & Risk Control
     DEFAULT_LEVERAGE: float = 10.0

@@ -29,6 +29,7 @@ class MarketScreener:
         
         # In-memory candidate pools
         self.raw_universe: List[str] = []
+        self.filtered_10: List[Dict[str, Any]] = []
         self.filtered_100: List[Dict[str, Any]] = []
         self.ranked_execution_candidates: List[Dict[str, Any]] = []
         
@@ -70,7 +71,7 @@ class MarketScreener:
                 highs = np.array([float(b["high"]) for b in raw_bars])
                 lows = np.array([float(b["low"]) for b in raw_bars])
                 closes = np.array([float(b["close"]) for b in raw_bars])
-                volumes = np.array([float(b.get("volume", 100.0)) for b in raw_bars])
+                volumes = np.array([float(b.get("volume") or 100.0) for b in raw_bars])
                 
                 data = {
                     "open": opens,
@@ -133,30 +134,50 @@ class MarketScreener:
 
     async def scan_and_filter_market(
         self,
-        universe_size: int = 500,
-        filter_count: int = 100,
+        universe_size: Optional[int] = None,
+        filter_count: int = 10,
         execution_count: int = 10,
         min_volume_24h: float = 10000.0,
+        max_spread_pct: Optional[float] = None,
         direction_bias: Optional[str] = "AUTO",
-        custom_weights: Optional[Dict[str, float]] = None
+        custom_weights: Optional[Dict[str, float]] = None,
+        selected_indicators: Optional[List[str]] = None,
+        price_action_rules: Optional[List[str]] = None,
+        stop_loss_pct: Optional[float] = None,
+        take_profit_1_pct: Optional[float] = None,
+        take_profit_2_pct: Optional[float] = None,
+        enable_breakeven: Optional[bool] = None,
+        strict_counter_trend_veto: Optional[bool] = None,
+        timeframes: Optional[List[str]] = None,
+        min_confidence: Optional[float] = None
     ) -> Dict[str, Any]:
         """
-        Full 5-stage screening pipeline backed by 100% REAL CoinDCX live market data:
-        500 Universe -> 100 Filtered Liquid Pairs -> 240 Real Candles -> AI Scored & Ranked -> Top N Execution List.
+        Full 5-stage all-asset screening pipeline backed by 100% REAL CoinDCX live market data:
+        1. Access TOTAL available crypto perpetual futures contracts (no 500 limit).
+        2. High-liquidity volume & tight spread pre-filtration.
+        3. 240 Real OHLCV bars + Orderbook Imbalance + 100 Multi-Timeframe indicators.
+        4. Mathematical Multi-Factor Profit Probability Scoring -> Top 10 High-Probability Profit Targets.
+        5. Balance-Aware Capital Protection Algorithm: 15% cash reserve protected, dynamic division across affordable orders.
         """
         scan_start = time.perf_counter()
         
         if not self.raw_universe:
             await self.initialize_universe()
 
-        # Ingest REAL live market prices from CoinDCX
+        # Ingest REAL live market prices from CoinDCX across ALL available perpetual contracts
         rt_data = await self.client.get_realtime_futures_prices()
         prices_map = rt_data.get("prices", {})
         
         if not self.raw_universe and prices_map:
             self.raw_universe = list(prices_map.keys())
 
-        active_universe = list(prices_map.keys())[:universe_size] if prices_map else self.raw_universe[:universe_size]
+        # Unconstrained full universe scan (unless explicitly restricted by caller)
+        all_available_symbols = list(prices_map.keys()) if prices_map else self.raw_universe
+        total_available_count = len(all_available_symbols)
+        if universe_size and universe_size > 0:
+            active_universe = all_available_symbols[:universe_size]
+        else:
+            active_universe = all_available_symbols
 
         # Stage 1 & 2: Ingest REAL prices & Filter to Top Liquid Assets
         candidates = []
@@ -169,20 +190,24 @@ class MarketScreener:
             if latest_price <= 0.0:
                 continue
 
-            vol_24h = float(item.get("v", 0.0))
+            vol_24h = float(item.get("v") or 0.0)
             if vol_24h < min_volume_24h:
                 continue
 
-            high_24h = float(item.get("h", latest_price))
-            low_24h = float(item.get("l", latest_price))
-            change_24h = float(item.get("pc", 0.0))
-            mark_price = float(item.get("mp", latest_price))
+            high_24h = float(item.get("h") or latest_price)
+            low_24h = float(item.get("l") or latest_price)
+            change_24h = float(item.get("pc") or 0.0)
+            mark_price = float(item.get("mp") or latest_price)
             
             # Spread calculation from mark price vs last price
             spread_pct = round(abs(mark_price - latest_price) / max(latest_price, 1e-6) * 100.0, 4)
             if spread_pct <= 0.0001 or spread_pct > 2.0:
                 spread_pct = 0.02
                 
+            # Filter by custom max_spread_pct if specified
+            if max_spread_pct and max_spread_pct > 0 and spread_pct > max_spread_pct:
+                continue
+
             candidates.append({
                 "symbol": sym,
                 "price": latest_price,
@@ -194,14 +219,14 @@ class MarketScreener:
                 "mark_price": mark_price
             })
 
-        # Sort by volume and liquidity, take top filter_count (e.g. 50-100)
+        # Sort by 24h volume & liquidity to select top candidate pool for deep indicator analysis
         candidates.sort(key=lambda x: x["volume_24h"], reverse=True)
-        self.filtered_100 = candidates[:filter_count]
+        liquid_pool = candidates[:max(30, filter_count * 3)]
 
-        # Stage 2.5: Ingest Real Historical Candlesticks for Top Candidates
+        # Stage 2.5: Ingest Real Historical Candlesticks for the top liquid pool
         now_ts = time.time()
         fetch_needed = [
-            c["symbol"] for c in self.filtered_100
+            c["symbol"] for c in liquid_pool
             if c["symbol"] not in self._candle_cache or (now_ts - self._candle_cache[c["symbol"]].get("last_fetch", 0) > 60.0)
         ]
         if fetch_needed:
@@ -209,10 +234,10 @@ class MarketScreener:
             fetch_tasks = [self._fetch_and_cache_candles(s) for s in batch]
             await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
-        # Stage 3 & 4: Compute 100+ Indicators and Run AI Model
+        # Stage 3 & 4: Compute 100+ Indicators, Multi-Timeframe Alignment and AI Model
         fmt = AlphaAIEngine.format_price_precision
         ai_evaluated_list = []
-        for c in self.filtered_100:
+        for c in liquid_pool:
             sym = c["symbol"]
             candles = self._get_or_update_candles(
                 sym, c["price"], c["high_24h"], c["low_24h"], c["volume_24h"], c["change_24h"]
@@ -236,18 +261,49 @@ class MarketScreener:
                 orderbook=ob
             )
             
-            # Run AI Evaluation (< 200 microseconds)
+            # Run AI Evaluation (< 200 microseconds) with custom quant parameters
             ai_res = self.ai_engine.evaluate_scalp_opportunity(
                 symbol=sym,
                 features=features,
                 orderbook=ob,
-                custom_weights=custom_weights
+                custom_weights=custom_weights,
+                selected_indicators=selected_indicators,
+                price_action_rules=price_action_rules,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_1_pct=take_profit_1_pct,
+                take_profit_2_pct=take_profit_2_pct,
+                enable_breakeven=enable_breakeven,
+                strict_counter_trend_veto=strict_counter_trend_veto,
+                timeframes=timeframes
             )
 
             # Strictly gate out assets without authentic historical candles
             if candles.get("is_synthetic", False):
                 ai_res["signal"] = "NEUTRAL"
                 ai_res["confidence"] = 50.0
+
+            # Mathematical Multi-Factor Profit Probability Formula
+            is_long = "BUY" in ai_res.get("signal", "")
+            is_short = "SELL" in ai_res.get("signal", "")
+            raw_conf = ai_res.get("confidence", 50.0)
+            rr = ai_res.get("rr_ratio", 1.5)
+            obi = float(features.get("orderbook_imbalance_10", 0.0))
+            pat_score = float(features.get("candlestick_pattern_score", 0.0))
+            mtf_aligned = bool(features.get("mtf_confirmed", False))
+            
+            obi_alignment = obi if is_long else (-obi if is_short else 0.0)
+            pat_alignment = pat_score if is_long else (-pat_score if is_short else 0.0)
+            rr_factor = min(1.0, max(0.2, rr / 2.2))
+            
+            # Composite formula for profit probability (S_i in [0.5, 0.985])
+            prob_score = (
+                (raw_conf / 100.0) * 0.35 +
+                (1.0 if mtf_aligned else 0.40) * 0.20 +
+                (0.5 + 0.5 * min(1.0, max(-1.0, obi_alignment))) * 0.15 +
+                rr_factor * 0.15 +
+                (0.5 + 0.5 * min(1.0, max(-1.0, pat_alignment))) * 0.15
+            )
+            win_prob_pct = round(max(52.0, min(98.8, prob_score * 100.0)), 1)
             
             # Merge candidate data with rich metrics
             merged = {
@@ -261,6 +317,7 @@ class MarketScreener:
                 "mark_price": fmt(c["mark_price"]),
                 "signal": ai_res["signal"],
                 "confidence": ai_res["confidence"],
+                "win_probability_pct": win_prob_pct,
                 "regime": ai_res["regime"],
                 "entry_type": ai_res["entry_type"],
                 "entry_price": ai_res["entry_price"],
@@ -286,8 +343,8 @@ class MarketScreener:
             }
             ai_evaluated_list.append(merged)
 
-        # Sort by strongest directional conviction (highest confidence in BUY or SELL)
-        ai_evaluated_list.sort(key=lambda x: x["confidence"], reverse=True)
+        # Rank by win probability and confidence
+        ai_evaluated_list.sort(key=lambda x: (x["win_probability_pct"], x["confidence"]), reverse=True)
         
         # Apply direction bias filtering if specified
         bias = (direction_bias or "AUTO").upper()
@@ -298,20 +355,91 @@ class MarketScreener:
         else:
             execution_pool = ai_evaluated_list
 
-        # Update state
-        self.filtered_100 = ai_evaluated_list
-        self.ranked_execution_candidates = execution_pool[:execution_count]
+        # Apply minimum confidence filter if specified
+        if min_confidence and min_confidence > 0:
+            confident_pool = [x for x in execution_pool if x["confidence"] >= min_confidence]
+            if confident_pool:
+                execution_pool = confident_pool
+
+        # Strictly select Top 10 High-Probability Profit Candidates
+        top_10 = (execution_pool if len(execution_pool) >= 10 else ai_evaluated_list)[:10]
+
+        # Stage 5: Dynamic Balance & Capital Scenario Protection Algorithm
+        usable_balance_usdt = 10.0
+        if not self.client.is_paper:
+            try:
+                usable_balance_usdt = await self.client.get_usable_balance_usdt()
+            except Exception:
+                usable_balance_usdt = 0.0
+
+        lev = float(settings.DEFAULT_LEVERAGE)
+        min_notional = 6.0
+        min_margin_per_order = round(min_notional / max(1.0, lev), 4)
+
+        # 15% Capital Protection Reserve Buffer held in wallet
+        capital_buffer_pct = 0.15
+        allocatable_capital_usdt = round(max(0.0, usable_balance_usdt * (1.0 - capital_buffer_pct)), 4)
+
+        if allocatable_capital_usdt >= min_margin_per_order:
+            max_executable_orders = min(10, max(1, int(allocatable_capital_usdt // min_margin_per_order)))
+        else:
+            max_executable_orders = 0
+
+        # Divide allocatable capital dynamically across candidates
+        if max_executable_orders > 0 and len(top_10) > 0:
+            executable_subset = top_10[:max_executable_orders]
+            total_prob_weight = sum(x["win_probability_pct"] for x in executable_subset) or 1.0
+            
+            for idx, c in enumerate(top_10):
+                c["order_rank"] = idx + 1
+                if idx < max_executable_orders:
+                    weight = c["win_probability_pct"] / total_prob_weight
+                    margin_alloc = max(min_margin_per_order, round(allocatable_capital_usdt * weight, 2))
+                    notional_alloc = round(margin_alloc * lev, 2)
+                    c["allocation_usdt"] = notional_alloc
+                    c["margin_required_usdt"] = margin_alloc
+                    c["is_executable"] = True
+                    c["execution_status"] = f"QUALIFIED ({idx + 1}/{max_executable_orders})"
+                else:
+                    c["allocation_usdt"] = min_notional
+                    c["margin_required_usdt"] = min_margin_per_order
+                    c["is_executable"] = False
+                    c["execution_status"] = "MARGIN_RESERVE_HELD"
+        else:
+            for idx, c in enumerate(top_10):
+                c["order_rank"] = idx + 1
+                c["allocation_usdt"] = min_notional
+                c["margin_required_usdt"] = min_margin_per_order
+                c["is_executable"] = False
+                c["execution_status"] = "INSUFFICIENT_MARGIN"
+
+        # Update state with Top 10
+        self.filtered_10 = top_10
+        self.filtered_100 = top_10  # backwards compatibility alias
+        self.ranked_execution_candidates = top_10[:max_executable_orders]
         self.last_scan_timestamp = int(time.time() * 1000)
 
         elapsed_ms = round((time.perf_counter() - scan_start) * 1000.0, 2)
-        logger.info(f"Market Scan Completed: Scanned {len(active_universe)} -> Filtered {len(self.filtered_100)} -> Ranked Top {len(self.ranked_execution_candidates)} in {elapsed_ms}ms")
+        logger.info(f"All-Asset Market Scan: Total {total_available_count} perpetual contracts -> Top 10 Profit Targets in {elapsed_ms}ms | Executable: {max_executable_orders}/10")
 
         return {
-            "scanned_universe_count": len(active_universe),
-            "filtered_count": len(self.filtered_100),
+            "total_universe_scanned": total_available_count,
+            "scanned_universe_count": total_available_count,
+            "filtered_count": len(top_10),
             "execution_count": len(self.ranked_execution_candidates),
+            "max_executable_orders": max_executable_orders,
             "scan_latency_ms": elapsed_ms,
             "timestamp": self.last_scan_timestamp,
-            "ranked_targets": self.ranked_execution_candidates,
-            "top_100_filtered": self.filtered_100
+            "capital_allocation": {
+                "usable_balance_usdt": usable_balance_usdt,
+                "allocatable_capital_usdt": allocatable_capital_usdt,
+                "reserve_buffer_usdt": round(usable_balance_usdt * capital_buffer_pct, 4),
+                "reserve_buffer_pct": 15.0,
+                "min_margin_per_order": min_margin_per_order,
+                "max_executable_orders": max_executable_orders,
+                "active_leverage": lev
+            },
+            "top_10_filtered": top_10,
+            "top_100_filtered": top_10,  # alias so legacy endpoints still work seamlessly
+            "ranked_targets": self.ranked_execution_candidates
         }

@@ -262,30 +262,22 @@ class AlphaRiskManager:
         total_inr = round(eq * inr_usd_rate, 2)
         free_inr = round(free * inr_usd_rate, 2)
 
-        # 2. Capital Protection Floor (Max Exposure Ceiling)
-        if eq < 20.0:
-            max_exposure_ratio = 0.25  # Leave 75% reserve floor for micro accounts
-            account_tier = "MICRO_STARTER"
-            max_concurrent_cap = 1
-        elif eq < 50.0:
-            max_exposure_ratio = 0.35  # Leave 65% reserve
-            account_tier = "GROWTH_TIER_1"
-            max_concurrent_cap = 2
-        elif eq < 100.0:
-            max_exposure_ratio = 0.45  # Leave 55% reserve
-            account_tier = "GROWTH_TIER_2"
-            max_concurrent_cap = 3
-        elif eq < 250.0:
-            max_exposure_ratio = 0.55  # Leave 45% reserve
-            account_tier = "PRO_TRADER"
-            max_concurrent_cap = 5
-        else:
-            max_exposure_ratio = 0.65
-            account_tier = "INSTITUTIONAL"
-            max_concurrent_cap = 10
-
+        # 2. Capital Protection Floor (15% Reserve Buffer, 85% Max Exposure)
+        reserve_buffer_pct = 0.15
+        max_exposure_ratio = 0.85  # 85% allocatable capital, preserving 15% buffer
         max_margin_budget_usdt = round(eq * max_exposure_ratio, 2)
         max_margin_budget_inr = round(max_margin_budget_usdt * inr_usd_rate, 2)
+
+        if eq < 20.0:
+            account_tier = "MICRO_STARTER"
+        elif eq < 50.0:
+            account_tier = "GROWTH_TIER_1"
+        elif eq < 100.0:
+            account_tier = "GROWTH_TIER_2"
+        elif eq < 250.0:
+            account_tier = "PRO_TRADER"
+        else:
+            account_tier = "INSTITUTIONAL"
 
         # 3. Dynamic Volatility-Scaled Leverage (ATR-based)
         atr_clamped = max(0.003, min(0.03, current_atr_pct))
@@ -297,10 +289,11 @@ class AlphaRiskManager:
         margin_per_order_usdt = round(order_notional_usdt / dynamic_leverage, 4)
         margin_per_order_inr = round(margin_per_order_usdt * inr_usd_rate, 2)
 
-        # 5. Dynamic Order Count Allocation Formula
+        # 5. Dynamic Order Count Allocation Formula (up to 10 concurrent orders)
         effective_budget_usdt = min(max_margin_budget_usdt, free)
         calculated_orders = int(effective_budget_usdt // margin_per_order_usdt) if margin_per_order_usdt > 0 else 0
-        dynamic_orders_count = max(1 if free >= margin_per_order_usdt else 0, min(max_concurrent_cap, calculated_orders))
+        dynamic_orders_count = max(1 if free >= margin_per_order_usdt else 0, min(10, calculated_orders))
+        max_concurrent_cap = 10
 
         # 6. Dynamic Risk per Trade (Fractional Kelly)
         p = min(0.95, max(0.50, ai_confidence / 100.0))

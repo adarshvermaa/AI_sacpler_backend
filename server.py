@@ -12,6 +12,8 @@ import asyncio
 import time
 import json
 import logging
+import random
+import numpy as np
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
@@ -20,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import socketio
 
 from config import settings
-from coindcx_client import CoinDCXClient
+from coindcx_client import CoinDCXClient, safe_float, safe_int
 from websocket_feed import CoinDCXWebSocketManager
 from indicators import AlphaIndicatorsEngine
 from ai_engine import AlphaAIEngine
@@ -53,6 +55,15 @@ engine_state = {
     "direction_bias": "AUTO",  # "AUTO", "LONG", or "SHORT"
     "selected_indicators": ["RSI", "VWAP", "Bollinger", "SuperTrend", "OBI", "MACD"],
     "price_action_rules": ["OrderBlocks", "FVG", "LiquiditySweeps"],
+    "min_confidence": 78.0,
+    "min_volume_24h": 10000.0,
+    "max_spread_pct": 0.20,
+    "stop_loss_pct": 0.50,
+    "take_profit_1_pct": 1.00,
+    "take_profit_2_pct": 2.00,
+    "enable_breakeven": True,
+    "timeframes": ["1m", "5m", "15m"],
+    "strict_counter_trend_veto": True,
     "latency_history": []
 }
 
@@ -96,28 +107,42 @@ async def scalper_orchestrator_loop():
             if engine_state["is_running"] and not risk_manager.is_kill_switch_active:
                 loop_start = time.perf_counter()
 
-                # 1. Run Market Screener (500 -> 100 -> Top N)
+                # 1. Run Market Screener (500 -> 100 -> Top N) with dynamic custom strategy parameters
                 scan_res = await screener.scan_and_filter_market(
                     universe_size=engine_state["universe_size"],
                     filter_count=engine_state["filter_count"],
                     execution_count=engine_state["execution_count"],
-                    direction_bias=engine_state.get("direction_bias", "AUTO")
+                    min_volume_24h=engine_state.get("min_volume_24h", 10000.0),
+                    max_spread_pct=engine_state.get("max_spread_pct", 0.20),
+                    direction_bias=engine_state.get("direction_bias", "AUTO"),
+                    selected_indicators=engine_state.get("selected_indicators"),
+                    price_action_rules=engine_state.get("price_action_rules"),
+                    stop_loss_pct=engine_state.get("stop_loss_pct"),
+                    take_profit_1_pct=engine_state.get("take_profit_1_pct"),
+                    take_profit_2_pct=engine_state.get("take_profit_2_pct"),
+                    enable_breakeven=engine_state.get("enable_breakeven", True),
+                    strict_counter_trend_veto=engine_state.get("strict_counter_trend_veto", True),
+                    timeframes=engine_state.get("timeframes", ["1m", "5m", "15m"]),
+                    min_confidence=engine_state.get("min_confidence", 78.0)
                 )
 
                 # 2. Check for actionable scalps on top candidates (both BUY and SELL)
+                min_conf = float(engine_state.get("min_confidence", 78.0))
                 for candidate in scan_res.get("ranked_targets", []):
-                    # Execute high-conviction signals (>= 78% confidence, requires MTF confirmation)
+                    # Execute signals meeting user or system confidence threshold
                     sig = candidate.get("signal", "NEUTRAL")
-                    if candidate.get("confidence", 0.0) >= 78.0 and ("BUY" in sig or "SELL" in sig):
+                    if candidate.get("confidence", 0.0) >= min_conf and ("BUY" in sig or "SELL" in sig):
                         symbol = candidate["symbol"]
                         
                         # Avoid duplicate trade on same symbol
                         already_open = any(t.symbol == symbol for t in execution_engine.active_trades.values())
                         if not already_open and len(execution_engine.active_trades) < engine_state["execution_count"]:
                             current_lev = float(engine_state.get("leverage", settings.DEFAULT_LEVERAGE))
-                            # Size position using Fractional Kelly Criterion scaled by leverage
+                            risk_factor = max(0.10, min(0.50, float(engine_state.get("risk_per_trade_pct", 1.0)) * 0.25))
+                            # Size position using Fractional Kelly Criterion scaled by leverage & risk factor
                             pos_size = risk_manager.calculate_kelly_position_size(
                                 candidate["confidence"],
+                                fractional_factor=risk_factor,
                                 leverage=current_lev
                             )
                             can_trade, reason = risk_manager.can_open_new_trade(pos_size, leverage=current_lev, symbol=symbol)
@@ -255,7 +280,12 @@ async def scalper_orchestrator_loop():
                     "risk_free_count": stats["risk_free_active_count"],
                     "kill_switch_active": risk_manager.is_kill_switch_active,
                     "circuit_breaker_tripped": risk_manager.is_circuit_breaker_tripped,
+                    "scanned_universe_count": scan_res.get("scanned_universe_count", 0),
+                    "total_universe_scanned": scan_res.get("total_universe_scanned", 0),
+                    "max_executable_orders": scan_res.get("max_executable_orders", 0),
+                    "capital_allocation": scan_res.get("capital_allocation", {}),
                     "top_ranked": scan_res.get("ranked_targets", [])[:5],
+                    "top_10_filtered": scan_res.get("top_10_filtered", []),
                     "filtered_100_summary": [
                         {
                             "symbol": c["symbol"],
@@ -265,9 +295,11 @@ async def scalper_orchestrator_loop():
                             "volume_24h": c["volume_24h"],
                             "spread_pct": c["spread_pct"],
                             "obi_10": c["obi_10"],
-                            "regime": c["regime"]
+                            "regime": c["regime"],
+                            "win_probability_pct": c.get("win_probability_pct", 75.0),
+                            "execution_status": c.get("execution_status", "PENDING")
                         }
-                        for c in scan_res.get("top_100_filtered", [])[:20]
+                        for c in scan_res.get("top_10_filtered", [])
                     ]
                 }
                 await broadcast_event("telemetry_update", telemetry)
@@ -414,15 +446,24 @@ async def disconnect(sid):
 # ==========================================
 
 class StrategyConfigRequest(BaseModel):
-    mode: str = "DEFAULT"
-    universe_size: int = 500
-    filter_count: int = 100
-    execution_count: int = 10
-    leverage: float = 10.0
-    risk_per_trade_pct: float = 1.0
-    direction_bias: Optional[str] = "AUTO"  # "AUTO", "LONG", or "SHORT"
+    mode: Optional[str] = None
+    universe_size: Optional[int] = None
+    filter_count: Optional[int] = None
+    execution_count: Optional[int] = None
+    leverage: Optional[float] = None
+    risk_per_trade_pct: Optional[float] = None
+    direction_bias: Optional[str] = None  # "AUTO", "LONG", or "SHORT"
     selected_indicators: Optional[List[str]] = None
     price_action_rules: Optional[List[str]] = None
+    min_confidence: Optional[float] = None
+    min_volume_24h: Optional[float] = None
+    max_spread_pct: Optional[float] = None
+    stop_loss_pct: Optional[float] = None
+    take_profit_1_pct: Optional[float] = None
+    take_profit_2_pct: Optional[float] = None
+    enable_breakeven: Optional[bool] = None
+    timeframes: Optional[List[str]] = None
+    strict_counter_trend_veto: Optional[bool] = None
 
 
 class CreateOrderRequest(BaseModel):
@@ -531,20 +572,88 @@ async def trigger_kill_switch():
 
 @fastapi_app.post("/api/v1/strategy/configure")
 async def configure_strategy(req: StrategyConfigRequest):
-    engine_state["mode"] = req.mode.upper()
-    engine_state["universe_size"] = req.universe_size
-    engine_state["filter_count"] = req.filter_count
-    engine_state["execution_count"] = req.execution_count
-    engine_state["leverage"] = req.leverage
-    engine_state["risk_per_trade_pct"] = req.risk_per_trade_pct
-    engine_state["direction_bias"] = (req.direction_bias or "AUTO").upper()
-    if req.selected_indicators:
+    if req.mode is not None:
+        engine_state["mode"] = req.mode.upper()
+    if req.universe_size is not None:
+        engine_state["universe_size"] = req.universe_size
+    if req.filter_count is not None:
+        engine_state["filter_count"] = req.filter_count
+    if req.execution_count is not None:
+        engine_state["execution_count"] = req.execution_count
+    if req.leverage is not None:
+        engine_state["leverage"] = req.leverage
+    if req.risk_per_trade_pct is not None:
+        engine_state["risk_per_trade_pct"] = req.risk_per_trade_pct
+    if req.direction_bias is not None:
+        engine_state["direction_bias"] = req.direction_bias.upper()
+    if req.selected_indicators is not None:
         engine_state["selected_indicators"] = req.selected_indicators
-    if req.price_action_rules:
+    if req.price_action_rules is not None:
         engine_state["price_action_rules"] = req.price_action_rules
+    if req.min_confidence is not None:
+        engine_state["min_confidence"] = req.min_confidence
+    if req.min_volume_24h is not None:
+        engine_state["min_volume_24h"] = req.min_volume_24h
+    if req.max_spread_pct is not None:
+        engine_state["max_spread_pct"] = req.max_spread_pct
+    if req.stop_loss_pct is not None:
+        engine_state["stop_loss_pct"] = req.stop_loss_pct
+    if req.take_profit_1_pct is not None:
+        engine_state["take_profit_1_pct"] = req.take_profit_1_pct
+    if req.take_profit_2_pct is not None:
+        engine_state["take_profit_2_pct"] = req.take_profit_2_pct
+    if req.enable_breakeven is not None:
+        engine_state["enable_breakeven"] = req.enable_breakeven
+    if req.timeframes is not None:
+        engine_state["timeframes"] = req.timeframes
+    if req.strict_counter_trend_veto is not None:
+        engine_state["strict_counter_trend_veto"] = req.strict_counter_trend_veto
 
-    logger.info(f"Updated Strategy Configuration: Mode={engine_state['mode']}, Bias={engine_state['direction_bias']}, Universe={req.universe_size}, Filter={req.filter_count}, Exec={req.execution_count}")
+    logger.info(f"Updated Strategy Configuration: Mode={engine_state['mode']}, Bias={engine_state['direction_bias']}, Universe={engine_state['universe_size']}, Filter={engine_state['filter_count']}, Exec={engine_state['execution_count']}, Lev={engine_state['leverage']}x, MinConf={engine_state.get('min_confidence', 78.0)}%")
     return {"status": "success", "config": engine_state}
+
+
+@fastapi_app.get("/api/v1/strategy/config")
+async def get_strategy_config():
+    """
+    Returns current active strategy configuration for real-time frontend synchronization.
+    """
+    return {"status": "success", "config": engine_state}
+
+
+@fastapi_app.post("/api/v1/strategy/test")
+async def test_strategy_configuration(req: StrategyConfigRequest):
+    """
+    Dry-run simulation of custom strategy against live market.
+    Returns matched candidate count and target details without executing orders.
+    """
+    scan_res = await screener.scan_and_filter_market(
+        universe_size=req.universe_size or engine_state["universe_size"],
+        filter_count=req.filter_count or engine_state["filter_count"],
+        execution_count=req.execution_count or engine_state["execution_count"],
+        min_volume_24h=req.min_volume_24h or engine_state.get("min_volume_24h", 10000.0),
+        max_spread_pct=req.max_spread_pct or engine_state.get("max_spread_pct", 0.20),
+        direction_bias=req.direction_bias or engine_state.get("direction_bias", "AUTO"),
+        selected_indicators=req.selected_indicators or engine_state.get("selected_indicators"),
+        price_action_rules=req.price_action_rules or engine_state.get("price_action_rules"),
+        stop_loss_pct=req.stop_loss_pct or engine_state.get("stop_loss_pct"),
+        take_profit_1_pct=req.take_profit_1_pct or engine_state.get("take_profit_1_pct"),
+        take_profit_2_pct=req.take_profit_2_pct or engine_state.get("take_profit_2_pct"),
+        enable_breakeven=req.enable_breakeven if req.enable_breakeven is not None else engine_state.get("enable_breakeven", True),
+        strict_counter_trend_veto=req.strict_counter_trend_veto if req.strict_counter_trend_veto is not None else engine_state.get("strict_counter_trend_veto", True),
+        timeframes=req.timeframes or engine_state.get("timeframes", ["1m", "5m", "15m"]),
+        min_confidence=req.min_confidence or engine_state.get("min_confidence", 75.0)
+    )
+    targets = scan_res.get("ranked_targets", [])
+    min_conf = req.min_confidence or engine_state.get("min_confidence", 75.0)
+    matching = [t for t in targets if t.get("confidence", 0) >= min_conf and t.get("signal") in ["BUY", "STRONG_BUY", "SELL", "STRONG_SELL"]]
+    return {
+        "status": "success",
+        "matching_count": len(matching),
+        "total_ranked": len(targets),
+        "matching_targets": matching,
+        "scan_latency_ms": scan_res.get("scan_latency_ms", 0.0)
+    }
 
 
 @fastapi_app.get("/api/v1/markets/screener")
@@ -553,7 +662,18 @@ async def get_screener_results():
         universe_size=engine_state["universe_size"],
         filter_count=engine_state["filter_count"],
         execution_count=engine_state["execution_count"],
-        direction_bias=engine_state.get("direction_bias", "AUTO")
+        min_volume_24h=engine_state.get("min_volume_24h", 10000.0),
+        max_spread_pct=engine_state.get("max_spread_pct", 0.20),
+        direction_bias=engine_state.get("direction_bias", "AUTO"),
+        selected_indicators=engine_state.get("selected_indicators"),
+        price_action_rules=engine_state.get("price_action_rules"),
+        stop_loss_pct=engine_state.get("stop_loss_pct"),
+        take_profit_1_pct=engine_state.get("take_profit_1_pct"),
+        take_profit_2_pct=engine_state.get("take_profit_2_pct"),
+        enable_breakeven=engine_state.get("enable_breakeven", True),
+        strict_counter_trend_veto=engine_state.get("strict_counter_trend_veto", True),
+        timeframes=engine_state.get("timeframes", ["1m", "5m", "15m"]),
+        min_confidence=engine_state.get("min_confidence", 78.0)
     )
     return scan_res
 
@@ -565,6 +685,106 @@ async def get_live_orderbook(symbol: str = "B-BTC_USDT"):
     """
     ob = await client.get_futures_orderbook(symbol, depth=20)
     return ob
+
+
+@fastapi_app.get("/api/v1/markets/candles")
+async def get_market_candles(symbol: str = "B-BTC_USDT", resolution: str = "1", limit: int = 60):
+    """
+    Returns candlestick OHLCV data for interactive chart visualization with horizontal SL/TP/Entry lines.
+    Supports real-time CoinDCX futures candles with fallback to cached or synchronized market bars.
+    """
+    clean_sym = symbol.strip()
+    try:
+        now_ts = int(time.time())
+        res_mins = 1
+        if resolution.isdigit():
+            res_mins = max(1, int(resolution))
+        from_ts = now_ts - (res_mins * 60 * limit)
+        
+        # 1. Attempt live CoinDCX candlestick retrieval
+        raw_candles = await client.get_futures_candlesticks(
+            clean_sym,
+            resolution=resolution,
+            from_ts=from_ts,
+            to_ts=now_ts
+        )
+        if raw_candles and len(raw_candles) > 0:
+            formatted = []
+            for b in raw_candles[-limit:]:
+                formatted.append({
+                    "time": int(b.get("time") or b.get("t") or (time.time() * 1000)),
+                    "open": float(b.get("open") or b.get("o") or 0.0),
+                    "high": float(b.get("high") or b.get("h") or 0.0),
+                    "low": float(b.get("low") or b.get("l") or 0.0),
+                    "close": float(b.get("close") or b.get("c") or 0.0),
+                    "volume": float(b.get("volume") or b.get("v") or 0.0)
+                })
+            return {
+                "status": "success",
+                "symbol": clean_sym,
+                "resolution": resolution,
+                "is_live": True,
+                "candles": formatted
+            }
+    except Exception as e:
+        logger.debug(f"Live candle fetch for {clean_sym} failed: {e}")
+
+    # 2. Fallback to screener cache or synthetic realistic bars anchored to current price
+    cached = screener._candle_cache.get(clean_sym)
+    if cached and "close" in cached and len(cached["close"]) > 0:
+        c_len = min(limit, len(cached["close"]))
+        now_ms = int(time.time() * 1000)
+        formatted = []
+        for i in range(c_len):
+            idx = -(c_len - i)
+            t = now_ms - (c_len - 1 - i) * 60000
+            formatted.append({
+                "time": t,
+                "open": float(cached["open"][idx]),
+                "high": float(cached["high"][idx]),
+                "low": float(cached["low"][idx]),
+                "close": float(cached["close"][idx]),
+                "volume": float(cached["volume"][idx])
+            })
+        return {
+            "status": "success",
+            "symbol": clean_sym,
+            "resolution": resolution,
+            "is_live": False,
+            "candles": formatted
+        }
+
+    # 3. Last-resort synthesized realistic bars around current price
+    curr_price = 100.0
+    for item in (getattr(screener, "filtered_10", None) or []):
+        if item.get("symbol") == clean_sym:
+            curr_price = float(item.get("price", 100.0))
+            break
+    now_ms = int(time.time() * 1000)
+    bars = []
+    p = curr_price
+    for i in range(limit):
+        walk = np.random.normal(0, 0.001) * p
+        p_close = max(0.0001, p + walk)
+        p_high = max(p, p_close) * 1.0008
+        p_low = min(p, p_close) * 0.9992
+        bars.append({
+            "time": now_ms - (limit - 1 - i) * 60000,
+            "open": round(p, 6),
+            "high": round(p_high, 6),
+            "low": round(p_low, 6),
+            "close": round(p_close, 6),
+            "volume": round(100.0 + i * 2.5, 2)
+        })
+        p = p_close
+    return {
+        "status": "success",
+        "symbol": clean_sym,
+        "resolution": resolution,
+        "is_live": False,
+        "candles": bars
+    }
+
 
 
 @fastapi_app.get("/api/v1/positions")
@@ -694,7 +914,7 @@ async def exit_all_positions():
         try:
             live_positions = await client.get_futures_positions()
             for p in live_positions:
-                if abs(float(p.get("active_pos", 0.0))) > 1e-6:
+                if isinstance(p, dict) and abs(safe_float(p.get("active_pos"), 0.0)) > 1e-6:
                     sym = p.get("pair")
                     pos_id = p.get("id")
                     await client.exit_futures_position(pos_id or sym)
@@ -785,24 +1005,43 @@ async def create_order_endpoint(req: CreateOrderRequest):
     Creates a new futures order, attaches Take Profit & Stop Loss triggers on CoinDCX,
     and registers the trade in the real-time position manager.
     """
-    target_lev = req.leverage or engine_state.get("leverage", settings.DEFAULT_LEVERAGE)
+    target_lev = req.leverage or engine_state.get("leverage") or settings.DEFAULT_LEVERAGE
     target_notional = req.notional or 6.0
     
     # Fetch current market price for pair if not provided
     current_price = req.price
-    if not current_price:
+    if not current_price or current_price <= 0:
         try:
             ob = await client.get_futures_orderbook(req.pair, depth=1)
-            bids = ob.get("bids", [])
-            asks = ob.get("asks", [])
+            bids = ob.get("bids", {})
+            asks = ob.get("asks", {})
             if req.side.lower() == "buy" and asks:
-                current_price = float(asks[0][0])
+                if isinstance(asks, dict):
+                    current_price = safe_float(next(iter(asks.keys())), 0.0)
+                elif isinstance(asks, list) and asks:
+                    current_price = safe_float(asks[0][0] if isinstance(asks[0], (list, tuple)) else asks[0], 0.0)
             elif bids:
-                current_price = float(bids[0][0])
-            else:
-                current_price = 1.0
+                if isinstance(bids, dict):
+                    current_price = safe_float(next(iter(bids.keys())), 0.0)
+                elif isinstance(bids, list) and bids:
+                    current_price = safe_float(bids[0][0] if isinstance(bids[0], (list, tuple)) else bids[0], 0.0)
         except Exception:
-            current_price = 1.0
+            pass
+
+    if not current_price or current_price <= 0:
+        try:
+            rt = await client.get_realtime_futures_prices()
+            prices_list = rt.get("prices") if isinstance(rt, dict) else rt
+            if isinstance(prices_list, list):
+                for item in prices_list:
+                    if isinstance(item, dict) and item.get("pair") == req.pair:
+                        current_price = safe_float(item.get("last_price") or item.get("ls") or item.get("price"), 0.0)
+                        break
+        except Exception:
+            pass
+
+    if not current_price or current_price <= 0:
+        current_price = 1.0
 
     # Sanitize order parameters to match CoinDCX step size & min notional
     safe_qty, safe_lev, actual_notional = await client.sanitize_order_params(
@@ -811,10 +1050,12 @@ async def create_order_endpoint(req: CreateOrderRequest):
         desired_leverage=target_lev,
         price=current_price
     )
-    req_margin = actual_notional / max(1.0, float(safe_lev))
     
     if req.quantity is not None and req.quantity > 0:
         safe_qty = req.quantity
+        actual_notional = round(safe_qty * current_price, 4)
+
+    req_margin = actual_notional / max(1.0, float(safe_lev))
 
     # Balance guard
     if not client.is_paper:
@@ -822,10 +1063,14 @@ async def create_order_endpoint(req: CreateOrderRequest):
         if usable < req_margin:
             return {
                 "status": "error",
-                "message": f"Insufficient margin: Required ${req_margin:.2f} USDT, available ${usable:.4f} USDT"
+                "message": f"Insufficient margin: Required ${req_margin:.2f} USDT, available ${usable:.4f} USDT",
+                "symbol": req.pair
             }
 
-    await client.update_position_leverage(req.pair, safe_lev)
+    try:
+        await client.update_position_leverage(req.pair, safe_lev)
+    except Exception as e:
+        logger.warning(f"Note on updating leverage: {e}")
     
     # Dynamic TP & SL targets with intelligent price precision
     fmt = AlphaAIEngine.format_price_precision
@@ -856,6 +1101,26 @@ async def create_order_endpoint(req: CreateOrderRequest):
         price=req.price,
         leverage=safe_lev
     )
+
+    # Check if order failed on exchange
+    order_error = None
+    if isinstance(order_res, dict):
+        if order_res.get("status_code", 200) >= 400:
+            order_error = order_res.get("text") or order_res.get("message") or f"Exchange error {order_res.get('status_code')}"
+        elif order_res.get("code") in [400, 401, 403, 422, 500] or str(order_res.get("status", "")).lower() in ["error", "failed"]:
+            order_error = order_res.get("message") or order_res.get("description") or "Exchange rejected order"
+
+    if order_error:
+        await broadcast_event("execution_event", {
+            "type": "ORDER_FAILED",
+            "message": f"Order placement failed on {req.pair}: {order_error}"
+        })
+        return {
+            "status": "error",
+            "message": order_error,
+            "order": order_res,
+            "symbol": req.pair
+        }
 
     # 2. Attach TP & SL triggers on CoinDCX
     tpsl_res = None

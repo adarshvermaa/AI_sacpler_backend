@@ -13,9 +13,33 @@ import logging
 from typing import Dict, Any, Optional, List, Union
 import httpx
 
+import math
 from config import settings
 
 logger = logging.getLogger("AlphaScalper.CoinDCXClient")
+
+
+def safe_float(val: Any, default: float = 0.0) -> float:
+    """Safely converts any value to float, handling None, NaN, inf, invalid strings."""
+    if val is None:
+        return default
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_int(val: Any, default: int = 0) -> int:
+    """Safely converts any value to int, handling None, floats, strings."""
+    if val is None:
+        return default
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return default
 
 
 class CoinDCXClient:
@@ -136,7 +160,7 @@ class CoinDCXClient:
                 balances: Dict[str, float] = {}
                 for item in data:
                     curr = item.get("currency")
-                    bal = float(item.get("balance", 0.0))
+                    bal = safe_float(item.get("balance"), 0.0)
                     if curr:
                         balances[curr] = bal
                 return balances
@@ -185,8 +209,8 @@ class CoinDCXClient:
         locked_inr = 0.0
         for w in wallets:
             if w.get("currency_short_name") == "INR":
-                total_inr = float(w.get("balance", 0.0))
-                locked_inr = float(w.get("locked_balance", 0.0))
+                total_inr = safe_float(w.get("balance"), 0.0)
+                locked_inr = safe_float(w.get("locked_balance"), 0.0)
                 break
         avail_inr = max(0.0, total_inr - locked_inr)
         return {
@@ -206,11 +230,11 @@ class CoinDCXClient:
             return 10.0
 
         fut_inr = await self.get_futures_inr_balance()
-        fut_free_usdt = fut_inr.get("available_usdt_equiv", 0.0)
+        fut_free_usdt = safe_float(fut_inr.get("available_usdt_equiv"), 0.0)
 
         balances = await self.get_account_balances()
-        spot_usdt = float(balances.get("USDT", 0.0))
-        spot_inr = float(balances.get("INR", 0.0)) / 87.5
+        spot_usdt = safe_float(balances.get("USDT"), 0.0)
+        spot_inr = safe_float(balances.get("INR"), 0.0) / 87.5
 
         return round(fut_free_usdt + spot_usdt + spot_inr, 4)
 
@@ -264,10 +288,10 @@ class CoinDCXClient:
                 result["auth_api"] = "AUTHENTICATED"
                 result["balances"] = {k: round(v, 6) for k, v in balances.items() if v > 0}
                 
-                spot_usdt = float(balances.get("USDT", 0.0)) if balances else 0.0
-                spot_inr = float(balances.get("INR", 0.0)) if balances else 0.0
-                fut_free_usdt = fut_inr_info.get("available_usdt_equiv", 0.0)
-                fut_total_usdt = fut_inr_info.get("total_usdt_equiv", 0.0)
+                spot_usdt = safe_float(balances.get("USDT"), 0.0) if balances else 0.0
+                spot_inr = safe_float(balances.get("INR"), 0.0) if balances else 0.0
+                fut_free_usdt = safe_float(fut_inr_info.get("available_usdt_equiv"), 0.0)
+                fut_total_usdt = safe_float(fut_inr_info.get("total_usdt_equiv"), 0.0)
                 
                 # Total usable margin is available futures free margin + spot assets
                 total_usable_usdt = round(fut_free_usdt + spot_usdt + (spot_inr / 87.5), 4)
@@ -275,9 +299,9 @@ class CoinDCXClient:
                 
                 result["total_usdt_balance"] = total_equity_usdt
                 result["available_usdt_balance"] = total_usable_usdt
-                result["futures_inr_balance"] = fut_inr_info.get("total_inr", 0.0)
-                result["futures_inr_available"] = fut_inr_info.get("available_inr", 0.0)
-                result["futures_inr_locked"] = fut_inr_info.get("locked_inr", 0.0)
+                result["futures_inr_balance"] = safe_float(fut_inr_info.get("total_inr"), 0.0)
+                result["futures_inr_available"] = safe_float(fut_inr_info.get("available_inr"), 0.0)
+                result["futures_inr_locked"] = safe_float(fut_inr_info.get("locked_inr"), 0.0)
                 
                 # Check CoinDCX minimum notional margin sufficiency
                 if self.is_paper:
@@ -289,15 +313,15 @@ class CoinDCXClient:
                         result["is_balance_sufficient"] = True
                         result["strategy_status"] = "LIVE_EXECUTION_READY"
                         result["strategy_message"] = (
-                            f"CoinDCX Futures INR Wallet Verified! Total: ₹{fut_inr_info['total_inr']:.2f} INR "
-                            f"(~${total_equity_usdt:.2f} USDT) | Available Free Margin: ₹{fut_inr_info['available_inr']:.2f} INR "
+                            f"CoinDCX Futures INR Wallet Verified! Total: ₹{fut_inr_info.get('total_inr', 0.0):.2f} INR "
+                            f"(~${total_equity_usdt:.2f} USDT) | Available Free Margin: ₹{fut_inr_info.get('available_inr', 0.0):.2f} INR "
                             f"(~${total_usable_usdt:.2f} USDT). Dynamic live scalper is fully funded and active!"
                         )
                     else:
                         result["is_balance_sufficient"] = False
                         result["strategy_status"] = "BALANCE_GUARD_ACTIVE"
                         result["strategy_message"] = (
-                            f"Account verified! Total balance is ₹{fut_inr_info['total_inr']:.2f} INR (~${total_usable_usdt:.4f} USDT). "
+                            f"Account verified! Total balance is ₹{fut_inr_info.get('total_inr', 0.0):.2f} INR (~${total_usable_usdt:.4f} USDT). "
                             f"CoinDCX requires minimum $6.00 USDT per futures order. "
                             f"Market screener & AI indicators are actively analyzing live data; "
                             f"live execution orders are safely held by Balance Guard until wallet margin reaches $6.00."
@@ -315,7 +339,7 @@ class CoinDCXClient:
         try:
             pos = await self.get_futures_positions()
             if isinstance(pos, list):
-                open_pos = [p for p in pos if abs(float(p.get("active_pos", 0.0))) > 1e-6]
+                open_pos = [p for p in pos if isinstance(p, dict) and abs(safe_float(p.get("active_pos"), 0.0)) > 1e-6]
                 result["active_positions_count"] = len(open_pos)
                 result["open_positions"] = open_pos
             else:
@@ -381,28 +405,78 @@ class CoinDCXClient:
         3. Total notional >= min_notional required by CoinDCX
         Returns: (safe_quantity, safe_leverage, actual_notional)
         """
-        import math
-        notional = target_notional_usdt or kwargs.get("target_notional", 6.0)
-        lev = requested_leverage or kwargs.get("desired_leverage", 10.0)
-        
+        notional = safe_float(target_notional_usdt or kwargs.get("target_notional"), 6.0)
+        if notional <= 0:
+            notional = 6.0
+
+        lev = safe_float(requested_leverage or kwargs.get("desired_leverage"), 10.0)
+        if lev <= 0:
+            lev = 10.0
+
+        safe_price = safe_float(price, 1.0)
+        if safe_price <= 0:
+            safe_price = 1.0
+
         details = await self.get_cached_instrument_details(pair)
-        max_lev = float(details.get("max_leverage_long", 10.0)) if details else 10.0
-        safe_leverage = int(min(lev, max_lev))
-        
-        min_notional = float(details.get("min_notional", 6.0)) if details else 6.0
-        min_qty = float(details.get("min_quantity", 0.001)) if details else 0.001
-        qty_inc = float(details.get("quantity_increment", 0.001)) if details else 0.001
-        
+        if not isinstance(details, dict):
+            details = {}
+
+        # Max leverage check
+        raw_max_lev = (
+            details.get("max_leverage_long")
+            or details.get("max_leverage")
+            or details.get("leverage")
+        )
+        max_lev = safe_float(raw_max_lev, 20.0)
+        if max_lev <= 0:
+            max_lev = 20.0
+        safe_leverage = max(1, int(min(lev, max_lev)))
+
+        # Min notional check
+        raw_min_notional = details.get("min_notional") or details.get("minimum_notional")
+        min_notional = safe_float(raw_min_notional, 6.0)
+        if min_notional <= 0:
+            min_notional = 6.0
+
+        # Min quantity check
+        raw_min_qty = (
+            details.get("min_quantity")
+            or details.get("minimum_quantity")
+            or details.get("min_order_quantity")
+        )
+        min_qty = safe_float(raw_min_qty, 0.001)
+        if min_qty <= 0:
+            min_qty = 0.001
+
+        # Quantity increment check
+        raw_qty_inc = (
+            details.get("quantity_increment")
+            or details.get("step")
+            or details.get("quantity_step")
+            or details.get("contract_size")
+        )
+        qty_inc = safe_float(raw_qty_inc, 0.001)
+        if qty_inc <= 0:
+            qty_inc = 0.001
+
         # Buffer notional slightly above min_notional
         effective_notional = max(notional, min_notional * 1.02)
-        raw_qty = effective_notional / max(price, 1e-6)
-        
+        raw_qty = effective_notional / max(safe_price, 1e-6)
+
         # Ceil to valid step increment
         steps = math.ceil(round(raw_qty / qty_inc, 6))
-        safe_qty = round(steps * qty_inc, 6)
+        safe_qty = steps * qty_inc
         safe_qty = max(safe_qty, min_qty)
-        
-        actual_notional = round(safe_qty * price, 4)
+
+        # Format decimals cleanly based on qty_inc
+        if qty_inc >= 1.0:
+            safe_qty = float(round(safe_qty))
+        else:
+            inc_str = f"{qty_inc:.8f}".rstrip("0")
+            decimals = len(inc_str.split(".")[1]) if "." in inc_str else 3
+            safe_qty = round(safe_qty, max(0, min(decimals, 8)))
+
+        actual_notional = round(safe_qty * safe_price, 4)
         return safe_qty, safe_leverage, actual_notional
 
     async def get_realtime_futures_prices(self) -> Dict[str, Any]:
@@ -426,9 +500,15 @@ class CoinDCXClient:
                 data = resp.json()
                 bids = data.get("bids", {})
                 asks = data.get("asks", {})
-                # Sort and slice to requested depth
-                sorted_bids = dict(sorted([(p, q) for p, q in bids.items()], key=lambda x: float(x[0]), reverse=True)[:depth])
-                sorted_asks = dict(sorted([(p, q) for p, q in asks.items()], key=lambda x: float(x[0]))[:depth])
+                # Sort and slice to requested depth safely
+                if isinstance(bids, dict):
+                    sorted_bids = dict(sorted([(p, q) for p, q in bids.items() if p is not None], key=lambda x: safe_float(x[0]), reverse=True)[:depth])
+                else:
+                    sorted_bids = bids
+                if isinstance(asks, dict):
+                    sorted_asks = dict(sorted([(p, q) for p, q in asks.items() if p is not None], key=lambda x: safe_float(x[0]))[:depth])
+                else:
+                    sorted_asks = asks
                 return {"bids": sorted_bids, "asks": sorted_asks, "timestamp": data.get("timestamp")}
             return {}
         except Exception as e:
@@ -593,7 +673,7 @@ class CoinDCXClient:
         """Finds open position for a given pair symbol on CoinDCX."""
         positions = await self.get_futures_positions()
         for p in positions:
-            if p.get("pair") == symbol and abs(float(p.get("active_pos", 0.0))) > 1e-6:
+            if isinstance(p, dict) and p.get("pair") == symbol and abs(safe_float(p.get("active_pos"), 0.0)) > 1e-6:
                 return p
         return None
 
@@ -1017,34 +1097,37 @@ class CoinDCXClient:
                 resp = await self._safe_post(url, data=json_body, headers=headers)
                 if resp.status_code == 200:
                     data = resp.json()
-                    for p in data:
-                        active_qty = float(p.get("active_pos", 0.0))
-                        if abs(active_qty) > 1e-6:
-                            avg_price = float(p.get("avg_price") or 0.0)
-                            mark_price = float(p.get("mark_price") or avg_price)
-                            settle_rate = float(p.get("settlement_currency_avg_price") or 87.5)
-                            locked_margin = float(p.get("locked_margin") or p.get("locked_user_margin") or 0.0)
-                            
-                            is_long = active_qty > 0
-                            side = "BUY" if is_long else "SELL"
-                            abs_qty = abs(active_qty)
-                            
-                            pnl_usdt = (mark_price - avg_price) * abs_qty if is_long else (avg_price - mark_price) * abs_qty
-                            pnl_inr = pnl_usdt * settle_rate
-                            roe_pct = (pnl_usdt / locked_margin * 100.0) if locked_margin > 0 else 0.0
-                            
-                            p["side"] = side
-                            p["abs_quantity"] = round(abs_qty, 4)
-                            p["entry_price"] = avg_price
-                            p["mark_price"] = mark_price
-                            p["unrealized_pnl_usdt"] = round(pnl_usdt, 4)
-                            p["unrealized_pnl_inr"] = round(pnl_inr, 2)
-                            p["roe_percent"] = round(roe_pct, 2)
-                            p["tp_price"] = p.get("take_profit_trigger")
-                            p["sl_price"] = p.get("stop_loss_trigger")
-                            p["locked_margin_usdt"] = round(locked_margin, 4)
-                            p["locked_margin_inr"] = round(locked_margin * settle_rate, 2)
-                            all_active_positions.append(p)
+                    if isinstance(data, list):
+                        for p in data:
+                            if not isinstance(p, dict):
+                                continue
+                            active_qty = safe_float(p.get("active_pos"), 0.0)
+                            if abs(active_qty) > 1e-6:
+                                avg_price = safe_float(p.get("avg_price"), 0.0)
+                                mark_price = safe_float(p.get("mark_price"), avg_price)
+                                settle_rate = safe_float(p.get("settlement_currency_avg_price"), 87.5)
+                                locked_margin = safe_float(p.get("locked_margin") or p.get("locked_user_margin"), 0.0)
+                                
+                                is_long = active_qty > 0
+                                side = "BUY" if is_long else "SELL"
+                                abs_qty = abs(active_qty)
+                                
+                                pnl_usdt = (mark_price - avg_price) * abs_qty if is_long else (avg_price - mark_price) * abs_qty
+                                pnl_inr = pnl_usdt * settle_rate
+                                roe_pct = (pnl_usdt / locked_margin * 100.0) if locked_margin > 0 else 0.0
+                                
+                                p["side"] = side
+                                p["abs_quantity"] = round(abs_qty, 4)
+                                p["entry_price"] = avg_price
+                                p["mark_price"] = mark_price
+                                p["unrealized_pnl_usdt"] = round(pnl_usdt, 4)
+                                p["unrealized_pnl_inr"] = round(pnl_inr, 2)
+                                p["roe_percent"] = round(roe_pct, 2)
+                                p["tp_price"] = p.get("take_profit_trigger")
+                                p["sl_price"] = p.get("stop_loss_trigger")
+                                p["locked_margin_usdt"] = round(locked_margin, 4)
+                                p["locked_margin_inr"] = round(locked_margin * settle_rate, 2)
+                                all_active_positions.append(p)
             except Exception as e:
                 logger.error(f"Error querying positions for {curr}: {e}")
 
@@ -1074,7 +1157,10 @@ class CoinDCXClient:
         url = f"{self.base_url}/exchange/v1/derivatives/futures/positions/update_leverage"
         headers = self._get_auth_headers(signature)
         resp = await self._safe_post(url, data=json_body, headers=headers)
-        return resp.json()
+        try:
+            return resp.json()
+        except Exception:
+            return {"status_code": resp.status_code, "text": resp.text}
 
     async def close(self):
         """Close the underlying HTTP connection pool."""
