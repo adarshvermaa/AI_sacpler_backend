@@ -349,9 +349,16 @@ class AlphaIndicatorsEngine:
         if not bids or not asks:
             return 0.0, 0.0, 0.0, mid_price
 
-        # Sort bids descending, asks ascending
-        sorted_bids = sorted([(float(p), float(q)) for p, q in bids.items()], key=lambda x: x[0], reverse=True)
-        sorted_asks = sorted([(float(p), float(q)) for p, q in asks.items()], key=lambda x: x[0])
+        # Sort bids descending, asks ascending (support both list [[p, q], ...] and dict {p: q})
+        if isinstance(bids, dict):
+            sorted_bids = sorted([(float(p), float(q)) for p, q in bids.items()], key=lambda x: x[0], reverse=True)
+        else:
+            sorted_bids = sorted([(float(b[0]), float(b[1])) for b in bids], key=lambda x: x[0], reverse=True)
+
+        if isinstance(asks, dict):
+            sorted_asks = sorted([(float(p), float(q)) for p, q in asks.items()], key=lambda x: x[0])
+        else:
+            sorted_asks = sorted([(float(a[0]), float(a[1])) for a in asks], key=lambda x: x[0])
 
         def get_obi(depth: int) -> float:
             bid_vol = sum(q for _, q in sorted_bids[:depth])
@@ -488,10 +495,14 @@ class AlphaIndicatorsEngine:
         lows: np.ndarray,
         closes: np.ndarray,
         volumes: np.ndarray,
-        orderbook: Optional[Dict[str, Any]] = None
+        orderbook: Optional[Dict[str, Any]] = None,
+        candles_5m: Optional[Dict[str, np.ndarray]] = None,
+        candles_15m: Optional[Dict[str, np.ndarray]] = None,
+        delta_volume: Optional[np.ndarray] = None
     ) -> Dict[str, float]:
         """
         Computes 1m, 5m, and 15m indicators and calculates Tri-Timeframe Confluence.
+        Supports authentic 5m and 15m Binance candlestick history alongside 1m bars.
         Guarantees that scalps only trigger when Macro Trend (15m), Swing Momentum (5m),
         and Micro Candlestick Trigger (1m) are in strict alignment.
         """
@@ -500,17 +511,27 @@ class AlphaIndicatorsEngine:
         features = cls.compute_all_indicators(opens, highs, lows, closes, volumes, orderbook)
         curr_price = float(closes[-1]) if n > 0 else 100.0
 
-        if n < 45:
-            # Insufficient history for multi-timeframe confirmation
-            features["tf_15m_bias"] = 0.0
-            features["tf_5m_bias"] = 0.0
-            features["tf_1m_bias"] = 0.0
-            features["tri_timeframe_alignment"] = 0.0
-            features["mtf_confirmed"] = 0.0
-            return features
+        # Calculate Delta Volume Ratio if available (Binance Taker Buy vs Sell flow)
+        if delta_volume is not None and len(delta_volume) >= 5:
+            last_5_delta = float(np.sum(delta_volume[-5:]))
+            last_5_vol = float(np.sum(volumes[-5:]))
+            delta_ratio = float(last_5_delta / max(1e-6, last_5_vol))
+            features["delta_volume_ratio"] = round(delta_ratio, 4)
+        else:
+            features["delta_volume_ratio"] = 0.0
 
-        # 2. Resample to 5m (factor=5)
-        o_5m, h_5m, l_5m, c_5m, v_5m = cls.resample_ohlcv(opens, highs, lows, closes, volumes, factor=5)
+        # 2. 5m Candles (Use authentic Binance 5m if available, otherwise resample)
+        if candles_5m and len(candles_5m.get("close", [])) >= 8:
+            o_5m = candles_5m["open"]
+            h_5m = candles_5m["high"]
+            l_5m = candles_5m["low"]
+            c_5m = candles_5m["close"]
+            v_5m = candles_5m["volume"]
+        elif n >= 40:
+            o_5m, h_5m, l_5m, c_5m, v_5m = cls.resample_ohlcv(opens, highs, lows, closes, volumes, factor=5)
+        else:
+            o_5m, h_5m, l_5m, c_5m, v_5m = opens, highs, lows, closes, volumes
+
         n_5m = len(c_5m)
         if n_5m >= 8:
             rsi_5m = cls._fast_rsi(c_5m, period=min(14, n_5m - 2))
@@ -535,13 +556,34 @@ class AlphaIndicatorsEngine:
             rsi_5m = 50.0
             tf_5m_bias = 0.0
 
-        # 3. Resample to 15m (factor=15)
-        o_15m, h_15m, l_15m, c_15m, v_15m = cls.resample_ohlcv(opens, highs, lows, closes, volumes, factor=15)
+        # 3. 15m Candles (Use authentic Binance 15m if available, otherwise resample)
+        if candles_15m and len(candles_15m.get("close", [])) >= 5:
+            o_15m = candles_15m["open"]
+            h_15m = candles_15m["high"]
+            l_15m = candles_15m["low"]
+            c_15m = candles_15m["close"]
+            v_15m = candles_15m["volume"]
+        elif n >= 60:
+            o_15m, h_15m, l_15m, c_15m, v_15m = cls.resample_ohlcv(opens, highs, lows, closes, volumes, factor=15)
+        else:
+            o_15m, h_15m, l_15m, c_15m, v_15m = opens, highs, lows, closes, volumes
+
         n_15m = len(c_15m)
         if n_15m >= 5:
             rsi_15m = cls._fast_rsi(c_15m, period=min(14, n_15m - 2))
             _, _, _, st_15m_bull = cls._calc_supertrend(h_15m, l_15m, c_15m, period=min(5, n_15m - 2))
-            sma_trend_15m = 1.0 if c_15m[-1] > float(np.mean(c_15m)) else -1.0
+            
+            # Use authentic 50-period EMA if authentic history exists, else mean
+            if n_15m >= 50:
+                alpha = 2.0 / (50 + 1.0)
+                weights = (1 - alpha) ** np.arange(min(n_15m, 150))[::-1]
+                weights /= weights.sum()
+                ema_50_15m = float(np.dot(c_15m[-len(weights):], weights))
+                sma_trend_15m = 1.0 if c_15m[-1] > ema_50_15m else -1.0
+            else:
+                ema_50_15m = float(np.mean(c_15m))
+                sma_trend_15m = 1.0 if c_15m[-1] > ema_50_15m else -1.0
+
             st_15m_bias = 1.0 if st_15m_bull > 0.5 else -1.0
             rsi_15m_bias = np.clip((rsi_15m - 50.0) / 20.0, -1.0, 1.0)
             tf_15m_bias = float(np.clip((st_15m_bias * 0.45) + (sma_trend_15m * 0.35) + (rsi_15m_bias * 0.20), -1.0, 1.0))
@@ -554,13 +596,11 @@ class AlphaIndicatorsEngine:
         rsi_1m_bias = np.clip((features.get("rsi_14", 50.0) - 50.0) / 25.0, -1.0, 1.0)
         pa_1m = features.get("candlestick_pattern_score", 0.0)
         obi_10 = features.get("orderbook_imbalance_10", 0.0)
-        tf_1m_bias = float(np.clip((pa_1m * 0.35) + (obi_10 * 0.25) + (rsi_1m_bias * 0.20) + (st_1m_bias * 0.20), -1.0, 1.0))
+        tf_1m_bias = float(np.clip((pa_1m * 0.30) + (obi_10 * 0.25) + (rsi_1m_bias * 0.20) + (st_1m_bias * 0.15) + (features["delta_volume_ratio"] * 0.10), -1.0, 1.0))
 
         # 5. Tri-Timeframe Alignment & Strict Confluence Gating
-        # Strong Bullish Alignment: 15m >= 0.15 AND 5m >= 0.15 AND 1m >= 0.15
-        # Strong Bearish Alignment: 15m <= -0.15 AND 5m <= -0.15 AND 1m <= -0.15
-        is_bull_confluence = (tf_15m_bias >= 0.12 and tf_5m_bias >= 0.12 and tf_1m_bias >= 0.12)
-        is_bear_confluence = (tf_15m_bias <= -0.12 and tf_5m_bias <= -0.12 and tf_1m_bias <= -0.12)
+        is_bull_confluence = (tf_15m_bias >= 0.10 and tf_5m_bias >= 0.10 and tf_1m_bias >= 0.10)
+        is_bear_confluence = (tf_15m_bias <= -0.10 and tf_5m_bias <= -0.10 and tf_1m_bias <= -0.10)
 
         if is_bull_confluence:
             alignment = 1.0
@@ -569,7 +609,6 @@ class AlphaIndicatorsEngine:
             alignment = -1.0
             mtf_confirmed = 1.0
         else:
-            # Conflicting timeframes (e.g. 15m is in downtrend but 1m had a bounce) -> Gated!
             alignment = 0.0
             mtf_confirmed = 0.0
 
@@ -580,6 +619,7 @@ class AlphaIndicatorsEngine:
         features["tf_1m_bias"] = tf_1m_bias
         features["tri_timeframe_alignment"] = alignment
         features["mtf_confirmed"] = mtf_confirmed
+        features["is_authentic_mtf"] = bool(candles_5m is not None and candles_15m is not None)
 
         return features
 

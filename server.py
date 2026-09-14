@@ -29,6 +29,7 @@ from ai_engine import AlphaAIEngine
 from market_screener import MarketScreener
 from win_win_strategy import WinWinExecutionEngine
 from risk_manager import AlphaRiskManager
+from binance_client import to_binance_symbol
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("AlphaScalper.Server")
@@ -55,7 +56,7 @@ engine_state = {
     "direction_bias": "AUTO",  # "AUTO", "LONG", or "SHORT"
     "selected_indicators": ["RSI", "VWAP", "Bollinger", "SuperTrend", "OBI", "MACD"],
     "price_action_rules": ["OrderBlocks", "FVG", "LiquiditySweeps"],
-    "min_confidence": 78.0,
+    "min_confidence": 62.0,
     "min_volume_24h": 10000.0,
     "max_spread_pct": 0.20,
     "stop_loss_pct": 0.50,
@@ -99,20 +100,100 @@ async def broadcast_event(event_name: str, data: Any):
                 active_raw_websockets.remove(ws)
 
 
-async def scalper_orchestrator_loop():
-    """Continuous high-frequency loop running market scanning & execution."""
-    logger.info("AlphaScalper autonomous orchestrator loop started!")
+# Shared state for latest deep AI market scan
+latest_scan_result: Dict[str, Any] = {}
+
+# 1-Minute (60s) In-Memory Cache for CoinDCX Positions & Active Orders to prevent rate limits
+coindcx_cache: Dict[str, Any] = {
+    "positions": [],
+    "positions_last_fetched": 0.0,
+    "orders": [],
+    "orders_last_fetched": 0.0,
+    "ttl_seconds": 60.0  # Strictly throttled to 1 minute (60s)
+}
+
+async def coindcx_sync_1min_loop():
+    """
+    Periodic background worker running strictly every 1 minute (60s):
+    1. Syncs CoinDCX positions & active orders.
+    2. Performs automated 1-minute safety inspection: verifies active SL & TP on every open position.
+    3. Auto-heals by attaching algorithmic SL (-0.45%) and TP (+0.85%) if missing on exchange.
+    4. Pushes real-time updates via WebSocket.
+    """
+    logger.info("Starting CoinDCX 1-minute sync & SL/TP auto-healing worker...")
     while True:
         try:
-            if engine_state["is_running"] and not risk_manager.is_kill_switch_active:
-                loop_start = time.perf_counter()
+            await asyncio.sleep(60.0)  # Strictly 1 minute
+            now = time.time()
+            
+            live_pos = []
+            orders = []
+            
+            try:
+                live_pos = await client.get_futures_positions()
+            except Exception as e:
+                logger.debug(f"1-min positions sync error: {e}")
 
-                # 1. Run Market Screener (500 -> 100 -> Top N) with dynamic custom strategy parameters
+            try:
+                orders = await client.get_all_active_orders()
+            except Exception as e:
+                logger.debug(f"1-min active orders sync error: {e}")
+
+            # Safety Inspection & Auto-Healing Guard
+            if live_pos:
+                for p in live_pos:
+                    if not isinstance(p, dict):
+                        continue
+                    active_qty = safe_float(p.get("active_pos"), 0.0)
+                    if abs(active_qty) > 1e-6:
+                        try:
+                            reconcile_res = await client.verify_and_reconcile_position_tpsl(
+                                position=p,
+                                active_orders=orders,
+                                default_tp_ratio=settings.TP1_RATIO,
+                                default_sl_ratio=settings.HARD_SL_RATIO
+                            )
+                            if reconcile_res.get("status") == "auto_healed":
+                                sym = reconcile_res.get("pair")
+                                tp_val = reconcile_res.get("attached_tp")
+                                sl_val = reconcile_res.get("attached_sl")
+                                logger.info(f"🛡️ [AUTO-HEAL 1-MIN] Attached missing SL & TP for {sym} (TP={tp_val}, SL={sl_val})")
+                                await broadcast_event("execution_event", {
+                                    "type": "TPSL_AUTO_HEALED",
+                                    "symbol": sym,
+                                    "message": f"Auto-Heal Active: Attached missing SL (${sl_val}) & TP (${tp_val}) on CoinDCX for {sym}.",
+                                    "details": reconcile_res
+                                })
+                        except Exception as hr_err:
+                            logger.error(f"Error during 1-min TP/SL auto-healing for {p.get('pair')}: {hr_err}")
+
+            coindcx_cache["positions"] = live_pos or []
+            coindcx_cache["positions_last_fetched"] = now
+            coindcx_cache["orders"] = orders or []
+            coindcx_cache["orders_last_fetched"] = now
+
+            # Broadcast to WebSocket clients
+            await broadcast_event("positions_update", {"positions": live_pos, "timestamp": int(now * 1000)})
+            await broadcast_event("orders_update", {"orders": orders, "timestamp": int(now * 1000)})
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in coindcx_sync_1min_loop: {e}")
+            await asyncio.sleep(5.0)
+
+async def deep_ai_screener_loop():
+    """Continuous background worker running deep multi-factor market analysis on dynamic intervals (20s - 45s)."""
+    logger.info("AlphaScalper Deep AI Screener background worker started!")
+    global latest_scan_result
+    while True:
+        try:
+            if not risk_manager.is_kill_switch_active:
                 scan_res = await screener.scan_and_filter_market(
                     universe_size=engine_state["universe_size"],
                     filter_count=engine_state["filter_count"],
                     execution_count=engine_state["execution_count"],
-                    min_volume_24h=engine_state.get("min_volume_24h", 10000.0),
+                    min_volume_24h=engine_state.get("min_volume_24h", 15000.0),
                     max_spread_pct=engine_state.get("max_spread_pct", 0.20),
                     direction_bias=engine_state.get("direction_bias", "AUTO"),
                     selected_indicators=engine_state.get("selected_indicators"),
@@ -123,26 +204,65 @@ async def scalper_orchestrator_loop():
                     enable_breakeven=engine_state.get("enable_breakeven", True),
                     strict_counter_trend_veto=engine_state.get("strict_counter_trend_veto", True),
                     timeframes=engine_state.get("timeframes", ["1m", "5m", "15m"]),
-                    min_confidence=engine_state.get("min_confidence", 78.0)
+                    min_confidence=engine_state.get("min_confidence", 62.0),
+                    leverage=engine_state.get("leverage", settings.DEFAULT_LEVERAGE)
                 )
+                latest_scan_result = scan_res
+                
+                # Keep Binance WebSocket streaming top 10 candidates + any active trade symbols
+                top_syms = [c["symbol"] for c in scan_res.get("top_10_filtered", [])]
+                active_syms = [t.symbol for t in execution_engine.active_trades.values()]
+                screener.binance_client.update_monitored_symbols(top_syms + active_syms)
 
-                # 2. Check for actionable scalps on top candidates (both BUY and SELL)
-                min_conf = float(engine_state.get("min_confidence", 78.0))
-                for candidate in scan_res.get("ranked_targets", []):
-                    # Execute signals meeting user or system confidence threshold
+                await broadcast_event("screener_update", scan_res)
+                
+                # Dynamic sleep interval based on market condition
+                if engine_state["is_running"]:
+                    sleep_seconds = float(scan_res.get("suggested_next_scan_seconds", 25.0))
+                else:
+                    sleep_seconds = 30.0  # Steady background screening when execution engine is paused
+            else:
+                sleep_seconds = 10.0
+            
+            await asyncio.sleep(sleep_seconds)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Error in deep_ai_screener_loop: {e}", exc_info=True)
+            await asyncio.sleep(10.0)
+
+
+async def scalper_orchestrator_loop():
+    """High-frequency tick monitoring, real-time position management, and order execution."""
+    logger.info("AlphaScalper autonomous orchestrator loop started!")
+    global latest_scan_result
+    while True:
+        try:
+            if engine_state["is_running"] and not risk_manager.is_kill_switch_active:
+                loop_start = time.perf_counter()
+                scan_res = latest_scan_result or {}
+
+                # 1. Check for actionable scalps from latest Top 10 high-probability candidates
+                min_conf = float(engine_state.get("min_confidence", 62.0))
+                candidates_to_eval = scan_res.get("ranked_targets") or scan_res.get("top_10_filtered", [])
+                for candidate in candidates_to_eval:
                     sig = candidate.get("signal", "NEUTRAL")
-                    if candidate.get("confidence", 0.0) >= min_conf and ("BUY" in sig or "SELL" in sig):
+                    is_ev_viable = candidate.get("is_ev_viable", True)
+                    if candidate.get("confidence", 0.0) >= min_conf and ("BUY" in sig or "SELL" in sig) and is_ev_viable:
                         symbol = candidate["symbol"]
                         
-                        # Avoid duplicate trade on same symbol
                         already_open = any(t.symbol == symbol for t in execution_engine.active_trades.values())
                         if not already_open and len(execution_engine.active_trades) < engine_state["execution_count"]:
                             current_lev = float(engine_state.get("leverage", settings.DEFAULT_LEVERAGE))
-                            risk_factor = max(0.10, min(0.50, float(engine_state.get("risk_per_trade_pct", 1.0)) * 0.25))
-                            # Size position using Fractional Kelly Criterion scaled by leverage & risk factor
-                            pos_size = risk_manager.calculate_kelly_position_size(
-                                candidate["confidence"],
-                                fractional_factor=risk_factor,
+                            entry_p = float(candidate.get("entry_price") or candidate.get("price") or 100.0)
+                            sl_p = float(candidate.get("sl_price") or (entry_p * 0.995))
+                            risk_pct = float(engine_state.get("risk_per_trade_pct", 1.5))
+                            
+                            # Volatility parity sizing with ATR
+                            pos_size = risk_manager.calculate_volatility_parity_position_size(
+                                entry_price=entry_p,
+                                sl_price=sl_p,
+                                risk_per_trade_pct=risk_pct,
                                 leverage=current_lev
                             )
                             can_trade, reason = risk_manager.can_open_new_trade(pos_size, leverage=current_lev, symbol=symbol)
@@ -161,6 +281,13 @@ async def scalper_orchestrator_loop():
                                 )
                                 if trade:
                                     risk_manager.record_trade_entry(symbol)
+                                    coindcx_cache["positions_last_fetched"] = 0.0
+                                    coindcx_cache["orders_last_fetched"] = 0.0
+                                    b_sym = to_binance_symbol(symbol)
+                                    if b_sym.lower() not in screener.binance_client._monitored_symbols:
+                                        screener.binance_client.update_monitored_symbols(
+                                            screener.binance_client._monitored_symbols + [b_sym]
+                                        )
                                     await broadcast_event("execution_event", {
                                         "type": "ENTRY",
                                         "trade_id": trade.trade_id,
@@ -169,10 +296,9 @@ async def scalper_orchestrator_loop():
                                         "price": trade.entry_price,
                                         "size_usdt": pos_size,
                                         "leverage": current_lev,
-                                        "message": f"Executed {trade.side} Scalp on {symbol} @ ${trade.entry_price} (AI Signal: {sig}, Conviction: {candidate['confidence']}%, Leverage: {current_lev}x)"
+                                        "message": f"Executed {trade.side} Scalp on {symbol} @ ${trade.entry_price} (AI Signal: {sig}, Conviction: {candidate['confidence']}%, EV: +{candidate.get('expected_value_pct', 0.0)}%, Leverage: {current_lev}x)"
                                     })
                             else:
-                                # Throttle Cooldown / Guard notification to prevent spamming
                                 if "COOLDOWN" in reason or "BALANCE GUARD" in reason or "PACING" in reason:
                                     now_ts = time.time()
                                     if now_ts - engine_state.get("_last_guard_broadcast", 0.0) > 30.0:
@@ -183,19 +309,20 @@ async def scalper_orchestrator_loop():
                                             "message": f"[AI GUARD] Scalp signal on {symbol} held: {reason}"
                                         })
 
-                # 3. Simulate or update price movements on active trades using live ticks
+                # 2. Update price movements on active trades using live Binance ticks
+                # Active trades are NEVER closed due to ranking changes or timeouts; only TP1, TP2, or SL.
                 for trade_id, trade in list(execution_engine.active_trades.items()):
+                    b_sym = to_binance_symbol(trade.symbol)
+                    binance_p = screener.binance_client.latest_prices.get(b_sym)
                     cand = next((c for c in screener.filtered_100 if c["symbol"] == trade.symbol), None)
-                    curr_p = cand["price"] if cand else screener._candle_cache.get(trade.symbol, {}).get("close", [trade.entry_price])[-1]
+                    curr_p = binance_p or (cand["price"] if cand else screener._candle_cache.get(trade.symbol, {}).get("close", [trade.entry_price])[-1])
                     live_obi = float(cand.get("obi_10", 0.0)) if cand else 0.0
                     events = execution_engine.update_ticks(trade.symbol, float(curr_p), obi_10=live_obi)
                     for ev in events:
                         ev_type = ev.get("event")
-                        # Ensure real position is updated/flattened on CoinDCX if in live mode
                         if not client.is_paper:
                             if ev_type == "WIN_WIN_BREAKEVEN_LOCKED":
                                 try:
-                                    # 1. If half-size meets CoinDCX minimum notional ($6.00), scale out 50%
                                     half_qty = float(ev.get("half_closed_qty", 0.0))
                                     half_notional = half_qty * float(curr_p)
                                     if half_notional >= 6.0:
@@ -209,7 +336,6 @@ async def scalper_orchestrator_loop():
                                         )
                                         logger.info(f"[LIVE SYNC] Scaled out 50% ({half_qty}) on CoinDCX for {trade.symbol} @ ${curr_p}")
                                     
-                                    # 2. Ratchet exchange SL to Breakeven & TP to TP2
                                     await client.cancel_all_open_orders_for_position(trade.symbol)
                                     await client.create_futures_tpsl(
                                         position_id=trade.symbol,
@@ -220,16 +346,15 @@ async def scalper_orchestrator_loop():
                                 except Exception as be_err:
                                     logger.error(f"Error synchronizing Breakeven SL on CoinDCX for {trade.symbol}: {be_err}")
                                     
-                            elif ev_type in ("WIN_WIN_TP2_MAX_PROFIT", "STOP_EXECUTED", "MICRO_TIMEOUT_SCRATCH_EXIT"):
+                            elif ev_type in ("WIN_WIN_TP2_MAX_PROFIT", "STOP_EXECUTED"):
                                 try:
                                     await client.exit_futures_position(trade.symbol)
                                 except Exception as exit_err:
                                     logger.error(f"Error executing live position exit on CoinDCX for {trade.symbol}: {exit_err}")
                                 
-                                # Enforce structure cooldown on the symbol after exit
                                 risk_manager.record_trade_exit(trade.symbol)
+                                coindcx_cache["positions_last_fetched"] = 0.0
 
-                                # Immediately re-sync real CoinDCX INR wallet balance
                                 try:
                                     wallet_info = await client.get_futures_inr_balance()
                                     if wallet_info and wallet_info.get("total_inr", 0.0) > 0:
@@ -237,13 +362,14 @@ async def scalper_orchestrator_loop():
                                 except Exception as sync_err:
                                     logger.debug(f"Live balance re-sync error: {sync_err}")
                                     
-                        if ev_type in ("WIN_WIN_TP2_MAX_PROFIT", "STOP_EXECUTED", "MICRO_TIMEOUT_SCRATCH_EXIT"):
+                        if ev_type in ("WIN_WIN_TP2_MAX_PROFIT", "STOP_EXECUTED"):
                             risk_manager.record_trade_exit(trade.symbol)
+                            coindcx_cache["positions_last_fetched"] = 0.0
 
                         risk_manager.update_daily_pnl(ev.get("net_realized_pnl", ev.get("realized_pnl", 0.0)))
                         await broadcast_event("execution_event", ev)
 
-                # 4. Broadcast real-time telemetry to Next.js frontend
+                # 3. Broadcast real-time telemetry to Next.js frontend
                 loop_latency_ms = round((time.perf_counter() - loop_start) * 1000.0, 2)
                 engine_state["latency_history"].append(loop_latency_ms)
                 if len(engine_state["latency_history"]) > 30:
@@ -284,6 +410,8 @@ async def scalper_orchestrator_loop():
                     "total_universe_scanned": scan_res.get("total_universe_scanned", 0),
                     "max_executable_orders": scan_res.get("max_executable_orders", 0),
                     "capital_allocation": scan_res.get("capital_allocation", {}),
+                    "btc_regime": scan_res.get("btc_regime", "CHOP_COMPRESSION"),
+                    "btc_context": scan_res.get("btc_context", {}),
                     "top_ranked": scan_res.get("ranked_targets", [])[:5],
                     "top_10_filtered": scan_res.get("top_10_filtered", []),
                     "filtered_100_summary": [
@@ -297,6 +425,7 @@ async def scalper_orchestrator_loop():
                             "obi_10": c["obi_10"],
                             "regime": c["regime"],
                             "win_probability_pct": c.get("win_probability_pct", 75.0),
+                            "expected_value_pct": c.get("expected_value_pct", 0.0),
                             "execution_status": c.get("execution_status", "PENDING")
                         }
                         for c in scan_res.get("top_10_filtered", [])
@@ -304,7 +433,7 @@ async def scalper_orchestrator_loop():
                 }
                 await broadcast_event("telemetry_update", telemetry)
 
-            await asyncio.sleep(1.5)  # Fast 1.5s scan interval
+            await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -342,15 +471,38 @@ async def lifespan(app: FastAPI):
 
     # 3. Initialize Market Universe and Feeds
     await screener.initialize_universe()
+    try:
+        init_scan = await screener.scan_and_filter_market(
+            universe_size=engine_state["universe_size"],
+            filter_count=engine_state["filter_count"],
+            execution_count=engine_state["execution_count"],
+            min_volume_24h=engine_state.get("min_volume_24h", 15000.0),
+            max_spread_pct=engine_state.get("max_spread_pct", 0.20),
+            direction_bias=engine_state.get("direction_bias", "AUTO"),
+            timeframes=engine_state.get("timeframes", ["1m", "5m", "15m"]),
+            min_confidence=engine_state.get("min_confidence", 62.0),
+            leverage=engine_state.get("leverage", settings.DEFAULT_LEVERAGE)
+        )
+        latest_scan_result = init_scan
+        top_syms = [c["symbol"] for c in init_scan.get("top_10_filtered", [])]
+        screener.binance_client.update_monitored_symbols(top_syms)
+        logger.info(f"Initial AI Market Scan complete: {len(top_syms)} Top cryptos loaded on boot!")
+    except Exception as e:
+        logger.warning(f"Initial market scan during startup: {e}")
+
     asyncio.create_task(ws_manager.start())
-    task = asyncio.create_task(scalper_orchestrator_loop())
-    background_tasks.append(task)
+    task_screener = asyncio.create_task(deep_ai_screener_loop())
+    task_orchestrator = asyncio.create_task(scalper_orchestrator_loop())
+    task_binance_stream = asyncio.create_task(screener.binance_client.start_stream_manager())
+    task_coindcx_sync = asyncio.create_task(coindcx_sync_1min_loop())
+    background_tasks.extend([task_screener, task_orchestrator, task_binance_stream, task_coindcx_sync])
     yield
     # Shutdown
     logger.info("Stopping AlphaScalper Services...")
     for t in background_tasks:
         t.cancel()
     await ws_manager.stop()
+    await screener.binance_client.close()
     await client.close()
 
 
@@ -388,15 +540,22 @@ async def raw_websocket_endpoint(websocket: WebSocket):
         stats["current_capital"] = round(risk_manager.current_capital, 2)
         stats["current_capital_inr"] = round(risk_manager.current_capital * 87.5, 2)
         stats["inr_rate"] = 87.5
+        top_10 = latest_scan_result.get("top_10_filtered", [])
         await websocket.send_text(json.dumps({
             "event": "initial_state",
             "data": {
                 "is_running": engine_state["is_running"],
                 "mode": engine_state["mode"],
                 "config": engine_state,
-                "stats": stats
+                "stats": stats,
+                "top_10_filtered": top_10
             }
         }))
+        if latest_scan_result and "top_10_filtered" in latest_scan_result:
+            await websocket.send_text(json.dumps({
+                "event": "screener_update",
+                "data": latest_scan_result
+            }))
         while True:
             # Handle incoming client messages / ping-pong
             data = await websocket.receive_text()
@@ -428,12 +587,17 @@ async def connect(sid, environ):
     stats["current_capital"] = round(risk_manager.current_capital, 2)
     stats["current_capital_inr"] = round(risk_manager.current_capital * 87.5, 2)
     stats["inr_rate"] = 87.5
+    top_10 = latest_scan_result.get("top_10_filtered", [])
     await sio.emit("initial_state", {
         "is_running": engine_state["is_running"],
         "mode": engine_state["mode"],
         "config": engine_state,
-        "stats": stats
+        "stats": stats,
+        "top_10_filtered": top_10
     }, room=sid)
+
+    if latest_scan_result and "top_10_filtered" in latest_scan_result:
+        await sio.emit("screener_update", latest_scan_result, room=sid)
 
 
 @sio.event
@@ -537,12 +701,34 @@ async def get_exchange_positions_alias():
     return await get_positions()
 
 
+class StartEngineRequest(BaseModel):
+    leverage: Optional[float] = None
+
+
+@fastapi_app.get("/api/v1/contracts/leverage")
+async def get_contracts_leverage():
+    """Returns contract maximum leverage limits and current active leverage."""
+    leverage_map = {}
+    for pair, details in client._instrument_details_cache.items():
+        raw_max = details.get("max_leverage_long") or details.get("max_leverage") or details.get("leverage") or 20.0
+        leverage_map[pair] = float(raw_max)
+    return {
+        "active_leverage": engine_state.get("leverage", settings.DEFAULT_LEVERAGE),
+        "default_leverage": settings.DEFAULT_LEVERAGE,
+        "max_leverage_map": leverage_map
+    }
+
+
 @fastapi_app.post("/api/v1/engine/start")
-async def start_engine():
+async def start_engine(req: Optional[StartEngineRequest] = None):
     risk_manager.is_kill_switch_active = False
+    if req and req.leverage is not None and req.leverage > 0:
+        engine_state["leverage"] = float(req.leverage)
+        logger.info(f"Execution Engine manual leverage set to: {engine_state['leverage']}x")
     engine_state["is_running"] = True
-    logger.info("AlphaScalper Execution Engine STARTED!")
-    return {"status": "success", "is_running": True}
+    logger.info(f"AlphaScalper Execution Engine STARTED! (Active Leverage: {engine_state.get('leverage', settings.DEFAULT_LEVERAGE)}x)")
+    await broadcast_event("engine_status", {"is_running": True, "leverage": engine_state["leverage"]})
+    return {"status": "success", "is_running": True, "leverage": engine_state["leverage"]}
 
 
 @fastapi_app.post("/api/v1/engine/stop")
@@ -609,7 +795,7 @@ async def configure_strategy(req: StrategyConfigRequest):
     if req.strict_counter_trend_veto is not None:
         engine_state["strict_counter_trend_veto"] = req.strict_counter_trend_veto
 
-    logger.info(f"Updated Strategy Configuration: Mode={engine_state['mode']}, Bias={engine_state['direction_bias']}, Universe={engine_state['universe_size']}, Filter={engine_state['filter_count']}, Exec={engine_state['execution_count']}, Lev={engine_state['leverage']}x, MinConf={engine_state.get('min_confidence', 78.0)}%")
+    logger.info(f"Updated Strategy Configuration: Mode={engine_state['mode']}, Bias={engine_state['direction_bias']}, Universe={engine_state['universe_size']}, Filter={engine_state['filter_count']}, Exec={engine_state['execution_count']}, Lev={engine_state['leverage']}x, MinConf={engine_state.get('min_confidence', 62.0)}%")
     return {"status": "success", "config": engine_state}
 
 
@@ -642,10 +828,10 @@ async def test_strategy_configuration(req: StrategyConfigRequest):
         enable_breakeven=req.enable_breakeven if req.enable_breakeven is not None else engine_state.get("enable_breakeven", True),
         strict_counter_trend_veto=req.strict_counter_trend_veto if req.strict_counter_trend_veto is not None else engine_state.get("strict_counter_trend_veto", True),
         timeframes=req.timeframes or engine_state.get("timeframes", ["1m", "5m", "15m"]),
-        min_confidence=req.min_confidence or engine_state.get("min_confidence", 75.0)
+        min_confidence=req.min_confidence or engine_state.get("min_confidence", 62.0)
     )
     targets = scan_res.get("ranked_targets", [])
-    min_conf = req.min_confidence or engine_state.get("min_confidence", 75.0)
+    min_conf = req.min_confidence or engine_state.get("min_confidence", 62.0)
     matching = [t for t in targets if t.get("confidence", 0) >= min_conf and t.get("signal") in ["BUY", "STRONG_BUY", "SELL", "STRONG_SELL"]]
     return {
         "status": "success",
@@ -673,7 +859,7 @@ async def get_screener_results():
         enable_breakeven=engine_state.get("enable_breakeven", True),
         strict_counter_trend_veto=engine_state.get("strict_counter_trend_veto", True),
         timeframes=engine_state.get("timeframes", ["1m", "5m", "15m"]),
-        min_confidence=engine_state.get("min_confidence", 78.0)
+        min_confidence=engine_state.get("min_confidence", 62.0)
     )
     return scan_res
 
@@ -788,45 +974,86 @@ async def get_market_candles(symbol: str = "B-BTC_USDT", resolution: str = "1", 
 
 
 @fastapi_app.get("/api/v1/positions")
-async def get_positions():
+async def get_positions(force_refresh: bool = False):
     """
     Returns all active positions synced directly with live CoinDCX exchange.
+    Throttled by 3-minute (180s) in-memory cache to strictly avoid CoinDCX rate limits.
     Includes entry price, live mark price, liquidation price, TP, SL, and PnL in both INR and USDT.
     """
     trades = []
     seen_symbols = set()
+    now = time.time()
 
-    # 1. Query live CoinDCX exchange positions
+    # 1. Query live CoinDCX exchange positions with 3-minute (180s) throttling
     if not client.is_paper:
-        try:
-            live_pos = await client.get_futures_positions()
-            for p in live_pos:
-                sym = p.get("pair")
-                seen_symbols.add(sym)
-                trades.append({
-                    "trade_id": p.get("id"),
-                    "position_id": p.get("id"),
-                    "symbol": sym,
-                    "side": p.get("side", "BUY"),
-                    "entry_price": p.get("entry_price", 0.0),
-                    "mark_price": p.get("mark_price", 0.0),
-                    "liquidation_price": float(p.get("liquidation_price") or 0.0),
-                    "tp1_price": p.get("tp_price"),
-                    "sl_price": p.get("sl_price"),
-                    "is_risk_free": p.get("tp_price") is not None,
-                    "remaining_qty": p.get("abs_quantity", 0.0),
-                    "unrealized_pnl": p.get("unrealized_pnl_usdt", 0.0),
-                    "unrealized_pnl_inr": p.get("unrealized_pnl_inr", 0.0),
-                    "roe_percent": p.get("roe_percent", 0.0),
-                    "locked_margin_usdt": p.get("locked_margin_usdt", 0.0),
-                    "locked_margin_inr": p.get("locked_margin_inr", 0.0),
-                    "leverage": float(p.get("leverage") or 10.0),
-                    "state": "LIVE_OPEN",
-                    "is_live": True,
-                    "elapsed_seconds": 0
-                })
-        except Exception as e:
-            logger.error(f"Error fetching live positions from CoinDCX: {e}")
+        if force_refresh or (now - coindcx_cache["positions_last_fetched"] > coindcx_cache["ttl_seconds"]):
+            try:
+                live_pos = await client.get_futures_positions()
+                coindcx_cache["positions"] = live_pos or []
+                coindcx_cache["positions_last_fetched"] = now
+            except Exception as e:
+                logger.error(f"Error fetching live positions from CoinDCX: {e}")
+
+        for p in coindcx_cache.get("positions", []):
+            sym = p.get("pair")
+            seen_symbols.add(sym)
+            side = p.get("side", "BUY").upper()
+            entry_p = float(p.get("entry_price") or 0.0)
+            tp_p = p.get("tp_price")
+            sl_p = p.get("sl_price")
+
+            # Try to enrich TP/SL from internal execution engine if missing from exchange response
+            matched_trade = next((t for t in execution_engine.active_trades.values() if t.symbol == sym), None)
+            if matched_trade:
+                if not tp_p and matched_trade.tp1_price:
+                    tp_p = matched_trade.tp1_price
+                if not sl_p and matched_trade.sl_price:
+                    sl_p = matched_trade.sl_price
+                is_risk_free = matched_trade.is_risk_free
+            else:
+                # Also check active orders cache for this symbol if tp_p or sl_p is still missing
+                if not tp_p or not sl_p:
+                    for o in coindcx_cache.get("orders", []):
+                        if o.get("market") == sym or o.get("pair") == sym:
+                            order_type = str(o.get("order_type") or o.get("order_type_name") or "").lower()
+                            stop_p = float(o.get("stop_price") or o.get("trigger_price") or 0.0)
+                            if stop_p > 0:
+                                if "take_profit" in order_type and not tp_p:
+                                    tp_p = stop_p
+                                elif "stop" in order_type and not sl_p:
+                                    sl_p = stop_p
+
+                # Genuine risk-free check: Stop loss must be at or beyond entry price
+                is_risk_free = False
+                if entry_p > 0 and sl_p:
+                    sl_val = float(sl_p)
+                    if side == "BUY":
+                        is_risk_free = sl_val >= (entry_p * 0.9995)
+                    else:
+                        is_risk_free = sl_val <= (entry_p * 1.0005)
+
+            trades.append({
+                "trade_id": p.get("id"),
+                "position_id": p.get("id"),
+                "symbol": sym,
+                "side": side,
+                "entry_price": entry_p,
+                "mark_price": p.get("mark_price", entry_p),
+                "liquidation_price": float(p.get("liquidation_price") or 0.0),
+                "tp1_price": tp_p,
+                "sl_price": sl_p,
+                "is_risk_free": is_risk_free,
+                "remaining_qty": p.get("abs_quantity", 0.0),
+                "unrealized_pnl": p.get("unrealized_pnl_usdt", 0.0),
+                "unrealized_pnl_inr": p.get("unrealized_pnl_inr", 0.0),
+                "roe_percent": p.get("roe_percent", 0.0),
+                "locked_margin_usdt": p.get("locked_margin_usdt", 0.0),
+                "locked_margin_inr": p.get("locked_margin_inr", 0.0),
+                "leverage": float(p.get("leverage") or 10.0),
+                "state": "LIVE_OPEN",
+                "is_live": True,
+                "elapsed_seconds": 0
+            })
 
     # 2. Also merge any in-memory trades that haven't appeared on exchange or paper trades
     for t in execution_engine.active_trades.values():
@@ -871,6 +1098,7 @@ async def exit_single_position(payload: Dict[str, str]):
 
     # 1. Close on exchange
     res = await client.exit_futures_position(target)
+    coindcx_cache["positions_last_fetched"] = 0.0
     
     # 2. Also remove from execution_engine active_trades
     for tid, trade in list(execution_engine.active_trades.items()):
@@ -893,6 +1121,9 @@ async def exit_all_positions():
     Exits and liquidates all active positions both in memory and on the live exchange.
     """
     exited_trades = []
+    coindcx_cache["positions_last_fetched"] = 0.0
+    coindcx_cache["orders_last_fetched"] = 0.0
+
     # 1. Cancel all open/untriggered orders on exchange first
     if not client.is_paper:
         try:
@@ -931,16 +1162,22 @@ async def exit_all_positions():
 
 
 @fastapi_app.get("/api/v1/orders/active")
-async def get_active_orders_endpoint():
+async def get_active_orders_endpoint(force_refresh: bool = False):
     """
     Fetches all open and untriggered orders from CoinDCX (Futures TP/SL & Spot orders).
+    Throttled by 3-minute (180s) cache to strictly prevent exchange rate limits.
     """
-    try:
-        orders = await client.get_all_active_orders()
-        return {"status": "success", "orders": orders, "count": len(orders)}
-    except Exception as e:
-        logger.error(f"Error in get_active_orders: {e}")
-        return {"status": "error", "message": str(e), "orders": [], "count": 0}
+    now = time.time()
+    if not client.is_paper:
+        if force_refresh or (now - coindcx_cache["orders_last_fetched"] > coindcx_cache["ttl_seconds"]):
+            try:
+                orders = await client.get_all_active_orders()
+                coindcx_cache["orders"] = orders or []
+                coindcx_cache["orders_last_fetched"] = now
+            except Exception as e:
+                logger.error(f"Error in get_active_orders: {e}")
+                return {"status": "error", "message": str(e), "orders": coindcx_cache.get("orders", []), "count": len(coindcx_cache.get("orders", []))}
+    return {"status": "success", "orders": coindcx_cache.get("orders", []), "count": len(coindcx_cache.get("orders", []))}
 
 
 @fastapi_app.post("/api/v1/orders/cancel")
@@ -953,6 +1190,7 @@ async def cancel_order_endpoint(payload: Dict[str, Any]):
         return {"status": "error", "message": "Missing order_id"}
 
     res = await client.cancel_any_order(str(order_id))
+    coindcx_cache["orders_last_fetched"] = 0.0
     await broadcast_event("execution_event", {
         "type": "ORDER_CANCELLED",
         "message": f"Order {order_id} cancelled on CoinDCX."
@@ -967,6 +1205,7 @@ async def cancel_all_orders_endpoint():
     """
     fut_res = {}
     spot_res = {}
+    coindcx_cache["orders_last_fetched"] = 0.0
     if not client.is_paper:
         try:
             fut_res = await client.cancel_all_futures_open_orders(["INR", "USDT"])
@@ -1153,6 +1392,13 @@ async def create_order_endpoint(req: CreateOrderRequest):
     new_trade.entry_time = time.time()
     new_trade.current_state = WinWinOrderState.TIER1_FILLED
     execution_engine.active_trades[trade_id] = new_trade
+    coindcx_cache["positions_last_fetched"] = 0.0
+    coindcx_cache["orders_last_fetched"] = 0.0
+    b_sym = to_binance_symbol(req.pair)
+    if b_sym.lower() not in screener.binance_client._monitored_symbols:
+        screener.binance_client.update_monitored_symbols(
+            screener.binance_client._monitored_symbols + [b_sym]
+        )
 
     await broadcast_event("execution_event", {
         "type": "ORDER_PLACED_WITH_TPSL",

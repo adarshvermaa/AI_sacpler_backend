@@ -935,13 +935,16 @@ class CoinDCXClient:
         """
         Create Take Profit and Stop Loss triggers directly on an open position.
         Accepts either exact position UUID or symbol (e.g. 'B-BTC_USDT').
-        Includes retry loop to wait for exchange position registration after order fill.
+        Includes progressive retry loop (up to 10 attempts, 5 seconds) to wait
+        for exchange position registration after order fill.
         """
         if self.is_paper:
             for pair, pos in self._paper_positions.items():
-                if pos.get("id") == position_id or pair == position_id:
+                if pos.get("id") == position_id or pair == position_id or pos.get("pair") == position_id:
                     pos["take_profit_trigger"] = tp_stop_price
                     pos["stop_loss_trigger"] = sl_stop_price
+                    pos["tp_price"] = tp_stop_price
+                    pos["sl_price"] = sl_stop_price
                     return {
                         "status": "success",
                         "take_profit": {"stop_price": tp_stop_price, "order_type": "take_profit_market"},
@@ -952,14 +955,14 @@ class CoinDCXClient:
         actual_id = position_id
         if position_id.startswith("B-"):
             pos = None
-            for attempt in range(6):
+            for attempt in range(10):
                 pos = await self.get_position_by_symbol(position_id)
                 if pos and pos.get("id"):
                     actual_id = pos["id"]
                     break
                 await asyncio.sleep(0.5)
             if not pos or not pos.get("id"):
-                logger.warning(f"No active open position found on exchange for {position_id} after 6 attempts to attach TP/SL")
+                logger.warning(f"No active open position found on exchange for {position_id} after 10 attempts to attach TP/SL")
                 return {"status": "no_active_position"}
 
         timestamp = int(round(time.time() * 1000))
@@ -987,6 +990,99 @@ class CoinDCXClient:
             return resp.json()
         except Exception:
             return {"status_code": resp.status_code, "text": resp.text}
+
+    async def verify_and_reconcile_position_tpsl(
+        self,
+        position: Dict[str, Any],
+        active_orders: Optional[List[Dict[str, Any]]] = None,
+        default_tp_ratio: float = 0.0085,
+        default_sl_ratio: float = 0.0045
+    ) -> Dict[str, Any]:
+        """
+        1-Minute Safety Verification & Auto-Healing Guard:
+        Inspects an active futures position and verifies whether it has active Stop Loss and Take Profit triggers.
+        If either is missing, automatically computes algorithmic SL (-0.45%) and TP (+0.85%) and attaches them to CoinDCX.
+        """
+        pair = position.get("pair") or ""
+        pos_id = position.get("id") or pair
+        active_qty = safe_float(position.get("active_pos"), 0.0)
+        
+        if abs(active_qty) < 1e-6:
+            return {"status": "inactive_position", "pair": pair}
+            
+        is_long = active_qty > 0
+        avg_price = safe_float(position.get("avg_price") or position.get("entry_price"), 0.0)
+        if avg_price <= 0:
+            avg_price = safe_float(position.get("mark_price"), 0.0)
+        if avg_price <= 0:
+            return {"status": "invalid_entry_price", "pair": pair}
+
+        # Check existing triggers on position object
+        existing_tp = safe_float(position.get("take_profit_trigger") or position.get("tp_price"), 0.0)
+        existing_sl = safe_float(position.get("stop_loss_trigger") or position.get("sl_price"), 0.0)
+
+        # Check active orders for untriggered stop/take-profit orders if not on position
+        if active_orders:
+            for o in active_orders:
+                if not isinstance(o, dict):
+                    continue
+                if o.get("pair") == pair:
+                    otype = str(o.get("order_type", "")).lower()
+                    sprice = safe_float(o.get("stop_price") or o.get("price"), 0.0)
+                    if sprice > 0:
+                        if "take_profit" in otype:
+                            existing_tp = sprice
+                        elif "stop" in otype:
+                            existing_sl = sprice
+
+        has_tp = existing_tp > 0
+        has_sl = existing_sl > 0
+
+        if has_tp and has_sl:
+            return {
+                "status": "fully_protected",
+                "pair": pair,
+                "take_profit": existing_tp,
+                "stop_loss": existing_sl
+            }
+
+        # Auto-heal: Compute algorithmic TP and SL
+        if is_long:
+            calc_tp = round(avg_price * (1.0 + default_tp_ratio), 6)
+            calc_sl = round(avg_price * (1.0 - default_sl_ratio), 6)
+        else:
+            calc_tp = round(avg_price * (1.0 - default_tp_ratio), 6)
+            calc_sl = round(avg_price * (1.0 + default_sl_ratio), 6)
+
+        target_tp = existing_tp if has_tp else calc_tp
+        target_sl = existing_sl if has_sl else calc_sl
+
+        logger.info(
+            f"[AUTO-HEAL 1-MIN] Missing triggers detected on {pair} (TP: {has_tp}, SL: {has_sl}). "
+            f"Attaching algorithmic triggers: TP={target_tp}, SL={target_sl} (Entry: {avg_price})"
+        )
+
+        res = await self.create_futures_tpsl(
+            position_id=pos_id,
+            tp_stop_price=target_tp,
+            sl_stop_price=target_sl
+        )
+
+        # Update position record in place
+        position["take_profit_trigger"] = target_tp
+        position["stop_loss_trigger"] = target_sl
+        position["tp_price"] = target_tp
+        position["sl_price"] = target_sl
+
+        return {
+            "status": "auto_healed",
+            "pair": pair,
+            "position_id": pos_id,
+            "attached_tp": target_tp,
+            "attached_sl": target_sl,
+            "entry_price": avg_price,
+            "result": res
+        }
 
     async def exit_futures_position(self, position_id: str) -> Dict[str, Any]:
         """

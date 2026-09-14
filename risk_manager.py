@@ -204,6 +204,43 @@ class AlphaRiskManager:
             max_notional = round(self.current_capital * 0.50 * leverage, 2)
             return min(target_notional, max_notional)
 
+    def calculate_volatility_parity_position_size(
+        self,
+        entry_price: float,
+        sl_price: float,
+        risk_per_trade_pct: float = 1.5,
+        leverage: float = 10.0
+    ) -> float:
+        """
+        Volatility Parity Position Sizing (Fixed Dollar Risk per Trade):
+        Ensures that if Stop Loss is hit, the exact predetermined dollar amount is lost,
+        regardless of whether the asset is a high-volatility meme coin or low-volatility Bitcoin.
+        
+        Dollar Risk = Current Capital * (risk_per_trade_pct / 100)
+        Stop Distance % = abs(entry_price - sl_price) / entry_price
+        Target Notional = Dollar Risk / max(Stop Distance %, 0.003)
+        """
+        if entry_price <= 0 or sl_price <= 0:
+            return self.min_order_notional
+        
+        dollar_risk = self.current_capital * (risk_per_trade_pct / 100.0)
+        stop_dist_pct = abs(entry_price - sl_price) / entry_price
+        stop_dist_pct = max(0.003, stop_dist_pct)
+        
+        target_notional = round(dollar_risk / stop_dist_pct, 2)
+        min_margin_req = self.min_order_notional / max(1.0, leverage)
+        
+        if self.is_live_mode:
+            if target_notional < self.min_order_notional:
+                if min_margin_req <= self.current_capital * 0.85:
+                    target_notional = self.min_order_notional
+                else:
+                    return 0.0
+            max_notional = round(self.current_capital * 0.85 * leverage, 2)
+            return min(target_notional, max_notional)
+        else:
+            return max(self.min_order_notional, min(target_notional, round(self.current_capital * 0.50 * leverage, 2)))
+
     def validate_leverage(self, requested_leverage: float, notional_value: float) -> float:
         """Enforces CoinDCX tiered maximum leverage based on position notional size."""
         # Tiered limits as per CoinDCX documentation:

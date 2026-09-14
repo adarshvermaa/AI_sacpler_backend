@@ -46,8 +46,8 @@ class AlphaScalperSettings(BaseSettings):
     DEFAULT_ACTIVE_ORDERS: int = 10
     
     # Scalper Execution & Risk Control
-    DEFAULT_LEVERAGE: float = 10.0
-    MAX_LEVERAGE: float = 20.0
+    DEFAULT_LEVERAGE: float = 15.0
+    MAX_LEVERAGE: float = 50.0
     MARGIN_MODE: str = "isolated"  # "isolated" or "crossed"
     MARGIN_CURRENCY: str = "INR"   # "INR" for CoinDCX India accounts, or "USDT"
     

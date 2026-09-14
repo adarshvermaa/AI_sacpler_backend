@@ -41,7 +41,7 @@ class WinWinTrade:
         tp2_price: float,
         sl_price: float,
         breakeven_sl: float,
-        leverage: float = 10.0
+        leverage: float = 15.0
     ):
         self.trade_id = trade_id
         self.symbol = symbol
@@ -99,7 +99,7 @@ class WinWinExecutionEngine:
         sl_price: float,
         breakeven_sl: float,
         allocated_usdt: float = 250.0,
-        leverage: float = 10.0
+        leverage: float = 15.0
     ) -> Optional[WinWinTrade]:
         """
         Submits the Tri-Tier Multi-Order Slices and registers bracket state.
@@ -355,36 +355,9 @@ class WinWinExecutionEngine:
                 })
                 continue
 
-            # ==============================================================
-            # EVENT 4: MICROSTRUCTURE INVALIDATION OR SCALP EXPIRATION (10m)
-            # ==============================================================
-            elapsed = now - (trade.entry_time or now)
-            adverse_obi = (is_long and obi_10 < -0.65) or (not is_long and obi_10 > 0.65)
-            
-            if (elapsed > settings.MICRO_TIMEOUT_SECONDS or adverse_obi) and not trade.is_risk_free:
-                scratch_pnl = round(price_diff * trade.remaining_qty, 4)
-                exit_notional = trade.remaining_qty * current_price
-                exit_fee = round(exit_notional * 0.00059, 4)
-                trade.total_fees_paid += exit_fee
-                trade.realized_pnl += scratch_pnl
-                trade.net_realized_pnl = round(trade.realized_pnl - trade.total_fees_paid, 4)
-                trade.remaining_qty = 0.0
-                trade.current_state = WinWinOrderState.MICRO_TIMEOUT_CLOSED
-                trade.exit_time = now
-                self.closed_trades.append(trade)
-                self.active_trades.pop(trade_id, None)
-
-                events.append({
-                    "event": "MICRO_TIMEOUT_SCRATCH_EXIT",
-                    "trade_id": trade_id,
-                    "symbol": symbol,
-                    "total_realized_pnl": round(trade.realized_pnl, 4),
-                    "net_realized_pnl": trade.net_realized_pnl,
-                    "total_fees_paid": trade.total_fees_paid,
-                    "roe_pct": trade.roe_pct,
-                    "message": f"Scalp Maturity / Invalidation on {symbol}. Exited with Net PnL: ${trade.net_realized_pnl:.4f} (Fees: ${trade.total_fees_paid:.4f})."
-                })
-                logger.info(f"[{trade_id}] Scalp Maturity Scratch Exit! Net PnL: ${trade.net_realized_pnl:.4f}")
+            # Note: Active trades strictly remain open until TP1, TP2, or SL is triggered.
+            # No premature exit on timeout, ranking change, or orderbook noise.
+            pass
 
         return events
 
