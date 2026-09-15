@@ -161,10 +161,14 @@ class AlphaAIEngine:
 
     @staticmethod
     def format_price_precision(price: float) -> float:
-        """Intelligently rounds prices based on magnitude to avoid zeroing out sub-cent assets."""
+        """Intelligently rounds prices based on magnitude to avoid zeroing out sub-cent assets or violating tick sizes."""
         if price <= 0.0:
             return price
-        if price >= 1000.0:
+        if price >= 10000.0:
+            return round(price, 1)
+        elif price >= 1000.0:
+            return round(price, 2)
+        elif price >= 100.0:
             return round(price, 2)
         elif price >= 10.0:
             return round(price, 3)

@@ -71,11 +71,13 @@ class CoinDCXClient:
             "INR": settings.INITIAL_SIMULATION_BALANCE * 89.0
         }
         self._paper_order_counter = 100000
+        self.account_currency: str = getattr(settings, "MARGIN_CURRENCY", "INR")
         
         # Diagnostic & Connectivity Verification Cache
         self._last_verification_result: Optional[Dict[str, Any]] = None
         self._last_verification_time: float = 0.0
         self._instrument_details_cache: Dict[str, Dict[str, Any]] = {}
+        self._contract_rules: Dict[str, Dict[str, Any]] = {}
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Returns or instantiates active httpx AsyncClient tied to current loop."""
@@ -297,35 +299,70 @@ class CoinDCXClient:
                 total_usable_usdt = round(fut_free_usdt + spot_usdt + (spot_inr / 87.5), 4)
                 total_equity_usdt = round(fut_total_usdt + spot_usdt + (spot_inr / 87.5), 4)
                 
+                tot_inr = safe_float(fut_inr_info.get("total_inr"), 0.0)
+                tot_avail_inr = safe_float(fut_inr_info.get("available_inr"), 0.0)
+                tot_locked_inr = safe_float(fut_inr_info.get("locked_inr"), 0.0)
+
+                # Determine primary account currency based on wallet funding
+                if tot_inr > 0 or spot_inr > 0 or settings.MARGIN_CURRENCY == "INR":
+                    primary_currency = "INR"
+                else:
+                    primary_currency = "USDT"
+
+                self.account_currency = primary_currency
+                result["account_currency"] = primary_currency
+                result["currency_symbol"] = "₹" if primary_currency == "INR" else "$"
+                result["min_required_inr"] = round(result["min_required_usdt"] * 87.5, 2)
+
                 result["total_usdt_balance"] = total_equity_usdt
                 result["available_usdt_balance"] = total_usable_usdt
-                result["futures_inr_balance"] = safe_float(fut_inr_info.get("total_inr"), 0.0)
-                result["futures_inr_available"] = safe_float(fut_inr_info.get("available_inr"), 0.0)
-                result["futures_inr_locked"] = safe_float(fut_inr_info.get("locked_inr"), 0.0)
+                result["futures_inr_balance"] = tot_inr
+                result["futures_inr_available"] = tot_avail_inr
+                result["futures_inr_locked"] = tot_locked_inr
                 
                 # Check CoinDCX minimum notional margin sufficiency
                 if self.is_paper:
                     result["is_balance_sufficient"] = True
                     result["strategy_status"] = "SIMULATED_EXECUTION"
-                    result["strategy_message"] = f"Paper trading active with ${total_usable_usdt:.2f} simulated capital."
+                    if primary_currency == "INR":
+                        result["strategy_message"] = f"Paper trading active with ₹{total_usable_usdt * 87.5:.2f} INR (~${total_usable_usdt:.2f} USDT) simulated capital."
+                    else:
+                        result["strategy_message"] = f"Paper trading active with ${total_usable_usdt:.2f} USDT simulated capital."
                 else:
+                    min_inr = result["min_required_inr"]
                     if total_usable_usdt >= result["min_required_usdt"] or total_equity_usdt >= result["min_required_usdt"]:
                         result["is_balance_sufficient"] = True
                         result["strategy_status"] = "LIVE_EXECUTION_READY"
-                        result["strategy_message"] = (
-                            f"CoinDCX Futures INR Wallet Verified! Total: ₹{fut_inr_info.get('total_inr', 0.0):.2f} INR "
-                            f"(~${total_equity_usdt:.2f} USDT) | Available Free Margin: ₹{fut_inr_info.get('available_inr', 0.0):.2f} INR "
-                            f"(~${total_usable_usdt:.2f} USDT). Dynamic live scalper is fully funded and active!"
-                        )
+                        if primary_currency == "INR":
+                            result["strategy_message"] = (
+                                f"CoinDCX Futures INR Wallet Verified! Total Equity: ₹{tot_inr:.2f} INR (~${total_equity_usdt:.2f} USDT) | "
+                                f"Available Free Margin: ₹{tot_avail_inr:.2f} INR (~${total_usable_usdt:.2f} USDT). "
+                                f"Dynamic live scalper is fully funded and active!"
+                            )
+                        else:
+                            result["strategy_message"] = (
+                                f"CoinDCX Futures Wallet Verified! Total Equity: ${total_equity_usdt:.2f} USDT (~₹{tot_inr:.2f} INR) | "
+                                f"Available Free Margin: ${total_usable_usdt:.2f} USDT (~₹{tot_avail_inr:.2f} INR). "
+                                f"Dynamic live scalper is fully funded and active!"
+                            )
                     else:
                         result["is_balance_sufficient"] = False
                         result["strategy_status"] = "BALANCE_GUARD_ACTIVE"
-                        result["strategy_message"] = (
-                            f"Account verified! Total balance is ₹{fut_inr_info.get('total_inr', 0.0):.2f} INR (~${total_usable_usdt:.4f} USDT). "
-                            f"CoinDCX requires minimum $6.00 USDT per futures order. "
-                            f"Market screener & AI indicators are actively analyzing live data; "
-                            f"live execution orders are safely held by Balance Guard until wallet margin reaches $6.00."
-                        )
+                        if primary_currency == "INR":
+                            result["strategy_message"] = (
+                                f"CoinDCX INR Account Verified! Total Equity: ₹{tot_inr:.2f} INR (~${total_equity_usdt:.2f} USDT) | "
+                                f"Available Free Margin: ₹{tot_avail_inr:.2f} INR (Locked: ₹{tot_locked_inr:.2f} INR). "
+                                f"CoinDCX requires minimum ₹{min_inr:.2f} INR (~$6.00 USDT) margin per contract. "
+                                f"Market screener & AI indicators are actively analyzing 500+ assets; "
+                                f"live execution orders are safely held by Balance Guard until available margin reaches ₹{min_inr:.2f} INR."
+                            )
+                        else:
+                            result["strategy_message"] = (
+                                f"Account verified! Total balance is ${total_usable_usdt:.4f} USDT (~₹{tot_inr:.2f} INR). "
+                                f"CoinDCX requires minimum $6.00 USDT per futures order. "
+                                f"Market screener & AI indicators are actively analyzing live data; "
+                                f"live execution orders are safely held by Balance Guard until wallet margin reaches $6.00."
+                            )
             else:
                 result["auth_api"] = "FAILED (Invalid credentials or empty)"
                 result["strategy_status"] = "AUTH_FAILED"
@@ -389,6 +426,154 @@ class CoinDCXClient:
             if details:
                 self._instrument_details_cache[pair] = details
         return self._instrument_details_cache.get(pair)
+
+    def update_contract_rules(self, rules: Dict[str, Dict[str, Any]]):
+        """Updates internal contract specification rules (tick size, price precision, min qty)."""
+        if isinstance(rules, dict):
+            self._contract_rules.update(rules)
+
+    @staticmethod
+    def normalize_futures_symbol(s: str) -> str:
+        """
+        Normalizes contract symbols for robust matching across CoinDCX, Binance, and internal representations.
+        Examples:
+            'B-BTC_USDT' -> 'BTCUSDT'
+            'B-1000PEPE_USDT' -> '1000PEPEUSDT'
+            'B-SHIB_1000_USDT' -> '1000SHIBUSDT'
+            'BTC_USDT' -> 'BTCUSDT'
+        """
+        if not s:
+            return ""
+        clean = str(s).strip().upper()
+        if clean.startswith("B-"):
+            clean = clean[2:]
+        if "_1000_" in clean:
+            parts = clean.split("_1000_")
+            clean = f"1000{parts[0]}{parts[1]}"
+        return clean.replace("_", "").replace("-", "")
+
+    def sanitize_price_by_instrument(
+        self,
+        pair: str,
+        price: float,
+        is_tp: Optional[bool] = None,
+        is_long: Optional[bool] = None,
+        mark_price: Optional[float] = None
+    ) -> tuple[float, str]:
+        """
+        Sanitizes and quantizes prices strictly compliant with CoinDCX and exchange filters:
+        1. Queries cached Binance or CoinDCX tick_size and price_precision rules.
+        2. Applies adaptive fallback precision based on price scale (from 1 dec for BTC to 8-9 dec for PEPE/SHIB).
+        3. Quantizes to exact tick_size: steps = round(price / tick_size); quantized = steps * tick_size.
+        4. Validates directional safety against mark_price (Long SL < mark, Long TP > mark, Short SL > mark, Short TP < mark).
+        5. Formats as clean decimal string (NO scientific notation like 8.45e-06).
+        Returns: (quantized_float, formatted_string)
+        """
+        safe_p = safe_float(price, 0.0)
+        if safe_p <= 0:
+            return 0.0, "0.0"
+
+        norm = self.normalize_futures_symbol(pair)
+
+        # 1. Lookup cached contract rules (from Binance exchangeInfo)
+        rule = self._contract_rules.get(norm)
+        if not rule:
+            if norm.startswith("1000"):
+                rule = self._contract_rules.get(norm[4:])
+            else:
+                rule = self._contract_rules.get(f"1000{norm}")
+
+        tick_size = None
+        precision = None
+
+        if rule:
+            tick_size = safe_float(rule.get("tick_size"))
+            precision = int(rule.get("price_precision", 2))
+
+        # Check CoinDCX cached details
+        if tick_size is None or tick_size <= 0:
+            details = self._instrument_details_cache.get(pair) or {}
+            raw_tick = details.get("tick_size") or details.get("price_step") or details.get("step")
+            if raw_tick:
+                tick_size = safe_float(raw_tick)
+            if details.get("price_precision"):
+                precision = int(details.get("price_precision"))
+
+        # 2. Known standard instruments lookup table
+        if tick_size is None or tick_size <= 0:
+            norm_base = norm.replace("USDT", "").replace("1000", "")
+            if "BTC" in norm_base:
+                tick_size, precision = 0.1, 1
+            elif "ETH" in norm_base:
+                tick_size, precision = 0.01, 2
+            elif "SOL" in norm_base or "BNB" in norm_base:
+                tick_size, precision = 0.01, 2
+            elif "XRP" in norm_base or "ADA" in norm_base or "SUI" in norm_base:
+                tick_size, precision = 0.0001, 4
+            elif "DOGE" in norm_base:
+                tick_size, precision = 0.00001, 5
+            elif "PEPE" in norm_base or "SHIB" in norm_base or "BONK" in norm_base or "FLOKI" in norm_base:
+                if "1000" in norm:
+                    tick_size, precision = 0.00001, 5
+                else:
+                    tick_size, precision = 0.00000001, 8
+
+        # 3. Dynamic adaptive fallback based on price magnitude
+        if tick_size is None or tick_size <= 0:
+            if safe_p >= 10000.0:
+                tick_size, precision = 0.1, 1
+            elif safe_p >= 1000.0:
+                tick_size, precision = 0.01, 2
+            elif safe_p >= 100.0:
+                tick_size, precision = 0.01, 2
+            elif safe_p >= 10.0:
+                tick_size, precision = 0.001, 3
+            elif safe_p >= 1.0:
+                tick_size, precision = 0.0001, 4
+            elif safe_p >= 0.01:
+                tick_size, precision = 0.00001, 5
+            elif safe_p >= 0.0001:
+                tick_size, precision = 0.000001, 6
+            elif safe_p >= 0.000001:
+                tick_size, precision = 0.00000001, 8
+            else:
+                tick_size, precision = 0.000000001, 9
+
+        if precision is None:
+            tick_str = f"{tick_size:.10f}".rstrip("0")
+            precision = len(tick_str.split(".")[1]) if "." in tick_str else 2
+
+        # 4. Directional validation against mark_price (if provided)
+        # Prevents CoinDCX exchange rejections when intra-second volatility crosses trigger boundaries
+        validated_p = safe_p
+        safe_mark = safe_float(mark_price, 0.0)
+        if safe_mark > 0 and is_long is not None and is_tp is not None:
+            min_buffer = max(tick_size * 2, safe_mark * 0.002)
+            if is_long:
+                if is_tp:
+                    if validated_p <= safe_mark:
+                        validated_p = safe_mark + min_buffer
+                else:
+                    if validated_p >= safe_mark:
+                        validated_p = safe_mark - min_buffer
+            else:
+                if is_tp:
+                    if validated_p >= safe_mark:
+                        validated_p = safe_mark - min_buffer
+                else:
+                    if validated_p <= safe_mark:
+                        validated_p = safe_mark + min_buffer
+
+        validated_p = max(validated_p, tick_size)
+
+        # 5. Quantize to exact multiple of tick_size
+        steps = round(validated_p / tick_size)
+        quantized = steps * tick_size
+        quantized = round(quantized, precision)
+
+        # 6. Format cleanly as string WITHOUT scientific notation
+        formatted = f"{quantized:.{precision}f}"
+        return quantized, formatted
 
     async def sanitize_order_params(
         self,
@@ -670,11 +855,40 @@ class CoinDCXClient:
             return {"status_code": resp.status_code, "text": resp.text}
 
     async def get_position_by_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Finds open position for a given pair symbol on CoinDCX."""
+        """
+        Finds open position for a given pair symbol on CoinDCX.
+        Utilizes normalized matching to handle prefix (B-), suffix, underscore, and 1000 multiplier variations.
+        """
+        norm_target = self.normalize_futures_symbol(symbol)
+        norm_target_base = norm_target.replace("1000", "")
+
+        if self.is_paper:
+            for pair, p in self._paper_positions.items():
+                if abs(safe_float(p.get("active_pos"), 0.0)) > 1e-6:
+                    norm_p = self.normalize_futures_symbol(pair)
+                    norm_pos_pair = self.normalize_futures_symbol(p.get("pair", ""))
+                    if norm_p in (norm_target, norm_target_base) or norm_pos_pair in (norm_target, norm_target_base):
+                        return p
+            return None
+
         positions = await self.get_futures_positions()
+        # Pass 1: Exact or exact normalized match
         for p in positions:
-            if isinstance(p, dict) and p.get("pair") == symbol and abs(safe_float(p.get("active_pos"), 0.0)) > 1e-6:
+            if not isinstance(p, dict) or abs(safe_float(p.get("active_pos"), 0.0)) <= 1e-6:
+                continue
+            pair = p.get("pair", "")
+            if pair == symbol or self.normalize_futures_symbol(pair) == norm_target:
                 return p
+
+        # Pass 2: Base match ignoring 1000 multiplier differences
+        for p in positions:
+            if not isinstance(p, dict) or abs(safe_float(p.get("active_pos"), 0.0)) <= 1e-6:
+                continue
+            pair = p.get("pair", "")
+            norm_p_base = self.normalize_futures_symbol(pair).replace("1000", "")
+            if norm_p_base == norm_target_base:
+                return p
+
         return None
 
     async def cancel_futures_order(self, order_id: str) -> Dict[str, Any]:
@@ -929,67 +1143,248 @@ class CoinDCXClient:
     async def create_futures_tpsl(
         self,
         position_id: str,
-        tp_stop_price: float,
-        sl_stop_price: float
+        tp_stop_price: Optional[float] = None,
+        sl_stop_price: Optional[float] = None,
+        is_long: Optional[bool] = None,
+        mark_price: Optional[float] = None,
+        pair: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Create Take Profit and Stop Loss triggers directly on an open position.
         Accepts either exact position UUID or symbol (e.g. 'B-BTC_USDT').
-        Includes progressive retry loop (up to 10 attempts, 5 seconds) to wait
-        for exchange position registration after order fill.
+        Features:
+        1. Progressive retry loop (up to 12 attempts) waiting for exchange position fill.
+        2. Non-blocking async background worker fallback if exchange takes longer to register.
+        3. Instrument-specific tick-size and precision quantization (no scientific notation).
+        4. Directional validation against live mark_price to avoid exchange boundary rejections.
+        5. Fail-Safe Dual Fallback: if combined TP/SL fails, retries SL and TP independently.
         """
+        pos_pair = pair or position_id
+        pos_is_long = is_long
+        pos_mark = safe_float(mark_price, 0.0)
+
         if self.is_paper:
-            for pair, pos in self._paper_positions.items():
-                if pos.get("id") == position_id or pair == position_id or pos.get("pair") == position_id:
-                    pos["take_profit_trigger"] = tp_stop_price
-                    pos["stop_loss_trigger"] = sl_stop_price
-                    pos["tp_price"] = tp_stop_price
-                    pos["sl_price"] = sl_stop_price
-                    return {
-                        "status": "success",
-                        "take_profit": {"stop_price": tp_stop_price, "order_type": "take_profit_market"},
-                        "stop_loss": {"stop_price": sl_stop_price, "order_type": "stop_market"}
-                    }
+            norm_target = self.normalize_futures_symbol(position_id)
+            target_pos = None
+            for p_pair, pos in self._paper_positions.items():
+                if (pos.get("id") == position_id or 
+                    self.normalize_futures_symbol(p_pair) == norm_target or 
+                    self.normalize_futures_symbol(pos.get("pair", "")) == norm_target):
+                    target_pos = pos
+                    break
+            
+            if target_pos:
+                if tp_stop_price and tp_stop_price > 0:
+                    tp_quant, _ = self.sanitize_price_by_instrument(pos_pair, tp_stop_price, is_tp=True, is_long=pos_is_long, mark_price=pos_mark)
+                    target_pos["take_profit_trigger"] = tp_quant
+                    target_pos["tp_price"] = tp_quant
+                if sl_stop_price and sl_stop_price > 0:
+                    sl_quant, _ = self.sanitize_price_by_instrument(pos_pair, sl_stop_price, is_tp=False, is_long=pos_is_long, mark_price=pos_mark)
+                    target_pos["stop_loss_trigger"] = sl_quant
+                    target_pos["sl_price"] = sl_quant
+                return {
+                    "status": "success",
+                    "take_profit": {"stop_price": target_pos.get("tp_price"), "order_type": "take_profit_market"},
+                    "stop_loss": {"stop_price": target_pos.get("sl_price"), "order_type": "stop_market"}
+                }
             return {"status": "success"}
 
         actual_id = position_id
-        if position_id.startswith("B-"):
+        is_uuid = len(str(position_id)) == 36 and str(position_id).count("-") == 4
+
+        # If passed a symbol, poll for the active open position ID
+        if not is_uuid:
             pos = None
-            for attempt in range(10):
+            backoff_delays = [0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0, 3.5]
+            for attempt, delay in enumerate(backoff_delays):
                 pos = await self.get_position_by_symbol(position_id)
                 if pos and pos.get("id"):
                     actual_id = pos["id"]
+                    pos_pair = pos.get("pair") or pos_pair
+                    active_qty = safe_float(pos.get("active_pos"), 0.0)
+                    if pos_is_long is None and active_qty != 0:
+                        pos_is_long = active_qty > 0
+                    if pos_mark <= 0:
+                        pos_mark = safe_float(pos.get("mark_price"), 0.0)
                     break
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(delay)
+
             if not pos or not pos.get("id"):
-                logger.warning(f"No active open position found on exchange for {position_id} after 10 attempts to attach TP/SL")
-                return {"status": "no_active_position"}
+                logger.warning(
+                    f"⚠️ Position for {position_id} not yet registered after {len(backoff_delays)} attempts. "
+                    f"Scheduling background persistent attacher worker..."
+                )
+                asyncio.create_task(
+                    self._background_attach_tpsl(
+                        symbol=position_id,
+                        tp_stop_price=tp_stop_price,
+                        sl_stop_price=sl_stop_price,
+                        is_long=pos_is_long,
+                        mark_price=pos_mark,
+                        pair=pos_pair
+                    )
+                )
+                return {
+                    "status": "scheduled_in_background",
+                    "symbol": position_id,
+                    "message": "Position fill pending on CoinDCX. Background attachment task activated."
+                }
+
+        # Default direction if still unknown
+        if pos_is_long is None:
+            pos_is_long = True
+
+        # Sanitize prices using instrument tick size and price precision
+        tp_str = None
+        sl_str = None
+        tp_quant = None
+        sl_quant = None
+
+        if tp_stop_price and tp_stop_price > 0:
+            tp_quant, tp_str = self.sanitize_price_by_instrument(
+                pair=pos_pair,
+                price=tp_stop_price,
+                is_tp=True,
+                is_long=pos_is_long,
+                mark_price=pos_mark
+            )
+
+        if sl_stop_price and sl_stop_price > 0:
+            sl_quant, sl_str = self.sanitize_price_by_instrument(
+                pair=pos_pair,
+                price=sl_stop_price,
+                is_tp=False,
+                is_long=pos_is_long,
+                mark_price=pos_mark
+            )
 
         timestamp = int(round(time.time() * 1000))
-        body = {
+        body: Dict[str, Any] = {
             "timestamp": timestamp,
-            "id": actual_id,
-            "take_profit": {
-                "stop_price": str(tp_stop_price),
+            "id": actual_id
+        }
+        if tp_str:
+            body["take_profit"] = {
+                "stop_price": tp_str,
                 "order_type": "take_profit_market"
-            },
-            "stop_loss": {
-                "stop_price": str(sl_stop_price),
+            }
+        if sl_str:
+            body["stop_loss"] = {
+                "stop_price": sl_str,
                 "order_type": "stop_market"
             }
-        }
+
         json_body, signature = self._generate_signature(body)
         url = f"{self.base_url}/exchange/v1/derivatives/futures/positions/create_tpsl"
         headers = self._get_auth_headers(signature)
         resp = await self._safe_post(url, data=json_body, headers=headers)
+
         if resp.status_code == 200:
-            logger.info(f"Attached TP/SL to position {actual_id} on CoinDCX: TP={tp_stop_price}, SL={sl_stop_price}")
-        else:
-            logger.warning(f"CoinDCX create_tpsl [{resp.status_code}] for {actual_id}: {resp.text}")
-        try:
-            return resp.json()
-        except Exception:
-            return {"status_code": resp.status_code, "text": resp.text}
+            logger.info(f"✅ Attached TP/SL to position {actual_id} on CoinDCX: TP={tp_str}, SL={sl_str} (Instrument: {pos_pair})")
+            try:
+                return resp.json()
+            except Exception:
+                return {"status_code": 200, "status": "success"}
+
+        # FAIL-SAFE FALLBACK: If combined request rejected, attempt individual placement
+        logger.warning(
+            f"CoinDCX create_tpsl [{resp.status_code}] on {pos_pair} ({actual_id}): {resp.text}. "
+            f"Activating Fail-Safe Independent Placement..."
+        )
+
+        fallback_results: Dict[str, Any] = {"combined_error": resp.text, "status_code": resp.status_code}
+
+        # Step 1: Submit Stop-Loss individually (Capital protection is Top Priority!)
+        if sl_str:
+            sl_body = {
+                "timestamp": int(round(time.time() * 1000)),
+                "id": actual_id,
+                "stop_loss": {
+                    "stop_price": sl_str,
+                    "order_type": "stop_market"
+                }
+            }
+            sl_json, sl_sig = self._generate_signature(sl_body)
+            sl_resp = await self._safe_post(url, data=sl_json, headers=self._get_auth_headers(sl_sig))
+            if sl_resp.status_code == 200:
+                logger.info(f"🛡️ [FAIL-SAFE SUCCESS] Individual Stop Loss attached to {pos_pair}: SL={sl_str}")
+                fallback_results["stop_loss_status"] = "attached"
+                fallback_results["stop_loss_price"] = sl_str
+            else:
+                logger.error(f"❌ [FAIL-SAFE ERROR] Individual Stop Loss rejected on {pos_pair}: {sl_resp.text}")
+                fallback_results["stop_loss_status"] = "failed"
+                fallback_results["stop_loss_error"] = sl_resp.text
+
+        # Step 2: Submit Take-Profit individually
+        if tp_str:
+            tp_body = {
+                "timestamp": int(round(time.time() * 1000)),
+                "id": actual_id,
+                "take_profit": {
+                    "stop_price": tp_str,
+                    "order_type": "take_profit_market"
+                }
+            }
+            tp_json, tp_sig = self._generate_signature(tp_body)
+            tp_resp = await self._safe_post(url, data=tp_json, headers=self._get_auth_headers(tp_sig))
+            if tp_resp.status_code == 200:
+                logger.info(f"🎯 [FAIL-SAFE SUCCESS] Individual Take Profit attached to {pos_pair}: TP={tp_str}")
+                fallback_results["take_profit_status"] = "attached"
+                fallback_results["take_profit_price"] = tp_str
+            else:
+                logger.warning(f"Note on individual Take Profit rejection on {pos_pair}: {tp_resp.text}")
+                fallback_results["take_profit_status"] = "failed"
+                fallback_results["take_profit_error"] = tp_resp.text
+
+        return fallback_results
+
+    async def _background_attach_tpsl(
+        self,
+        symbol: str,
+        tp_stop_price: Optional[float],
+        sl_stop_price: Optional[float],
+        is_long: Optional[bool] = None,
+        mark_price: Optional[float] = None,
+        pair: Optional[str] = None
+    ):
+        """
+        Resilient background task that polls for exchange position registration
+        for up to 60 seconds and attaches sanitized TP/SL as soon as the position opens.
+        """
+        logger.info(f"⏳ [ASYNC TP/SL] Background attachment task initialized for {symbol}...")
+        for attempt in range(20):
+            await asyncio.sleep(2.5)
+            pos = await self.get_position_by_symbol(symbol)
+            if pos and pos.get("id"):
+                actual_id = pos["id"]
+                pos_pair = pos.get("pair") or pair or symbol
+                active_qty = safe_float(pos.get("active_pos"), 0.0)
+                pos_is_long = active_qty > 0 if active_qty != 0 else (is_long if is_long is not None else True)
+                pos_mark = safe_float(pos.get("mark_price"), mark_price or 0.0)
+
+                tp_str = None
+                sl_str = None
+                if tp_stop_price and tp_stop_price > 0:
+                    _, tp_str = self.sanitize_price_by_instrument(pos_pair, tp_stop_price, is_tp=True, is_long=pos_is_long, mark_price=pos_mark)
+                if sl_stop_price and sl_stop_price > 0:
+                    _, sl_str = self.sanitize_price_by_instrument(pos_pair, sl_stop_price, is_tp=False, is_long=pos_is_long, mark_price=pos_mark)
+
+                body = {"timestamp": int(round(time.time() * 1000)), "id": actual_id}
+                if tp_str:
+                    body["take_profit"] = {"stop_price": tp_str, "order_type": "take_profit_market"}
+                if sl_str:
+                    body["stop_loss"] = {"stop_price": sl_str, "order_type": "stop_market"}
+
+                json_body, signature = self._generate_signature(body)
+                url = f"{self.base_url}/exchange/v1/derivatives/futures/positions/create_tpsl"
+                headers = self._get_auth_headers(signature)
+                resp = await self._safe_post(url, data=json_body, headers=headers)
+                if resp.status_code == 200:
+                    logger.info(f"✅ [ASYNC TP/SL SUCCESS] Attached TP/SL to position {actual_id} ({pos_pair}) after attempt {attempt+1}!")
+                    return
+                else:
+                    logger.warning(f"Async TP/SL attempt {attempt+1} on {pos_pair} failed [{resp.status_code}]: {resp.text}")
+        logger.warning(f"⚠️ [ASYNC TP/SL TIMEOUT] Position {symbol} not found after 60s background monitoring.")
 
     async def verify_and_reconcile_position_tpsl(
         self,
@@ -1001,15 +1396,16 @@ class CoinDCXClient:
         """
         1-Minute Safety Verification & Auto-Healing Guard:
         Inspects an active futures position and verifies whether it has active Stop Loss and Take Profit triggers.
-        If either is missing, automatically computes algorithmic SL (-0.45%) and TP (+0.85%) and attaches them to CoinDCX.
+        If either is missing, automatically computes algorithmic SL (-0.45%) and TP (+0.85%) with instrument-specific
+        tick-size sanitization, and attaches them to CoinDCX.
         """
         pair = position.get("pair") or ""
         pos_id = position.get("id") or pair
         active_qty = safe_float(position.get("active_pos"), 0.0)
-        
+
         if abs(active_qty) < 1e-6:
             return {"status": "inactive_position", "pair": pair}
-            
+
         is_long = active_qty > 0
         avg_price = safe_float(position.get("avg_price") or position.get("entry_price"), 0.0)
         if avg_price <= 0:
@@ -1017,16 +1413,20 @@ class CoinDCXClient:
         if avg_price <= 0:
             return {"status": "invalid_entry_price", "pair": pair}
 
+        mark_p = safe_float(position.get("mark_price"), avg_price)
+
         # Check existing triggers on position object
         existing_tp = safe_float(position.get("take_profit_trigger") or position.get("tp_price"), 0.0)
         existing_sl = safe_float(position.get("stop_loss_trigger") or position.get("sl_price"), 0.0)
 
         # Check active orders for untriggered stop/take-profit orders if not on position
         if active_orders:
+            norm_pair = self.normalize_futures_symbol(pair)
             for o in active_orders:
                 if not isinstance(o, dict):
                     continue
-                if o.get("pair") == pair:
+                o_pair = o.get("pair") or o.get("market") or ""
+                if self.normalize_futures_symbol(o_pair) == norm_pair:
                     otype = str(o.get("order_type", "")).lower()
                     sprice = safe_float(o.get("stop_price") or o.get("price"), 0.0)
                     if sprice > 0:
@@ -1046,41 +1446,48 @@ class CoinDCXClient:
                 "stop_loss": existing_sl
             }
 
-        # Auto-heal: Compute algorithmic TP and SL
-        if is_long:
-            calc_tp = round(avg_price * (1.0 + default_tp_ratio), 6)
-            calc_sl = round(avg_price * (1.0 - default_sl_ratio), 6)
-        else:
-            calc_tp = round(avg_price * (1.0 - default_tp_ratio), 6)
-            calc_sl = round(avg_price * (1.0 + default_sl_ratio), 6)
+        # Auto-heal: Compute algorithmic TP and SL with sanitized instrument tick size
+        target_tp = None
+        target_sl = None
 
-        target_tp = existing_tp if has_tp else calc_tp
-        target_sl = existing_sl if has_sl else calc_sl
+        if not has_tp:
+            raw_tp = avg_price * (1.0 + default_tp_ratio) if is_long else avg_price * (1.0 - default_tp_ratio)
+            target_tp, _ = self.sanitize_price_by_instrument(pair, raw_tp, is_tp=True, is_long=is_long, mark_price=mark_p)
+
+        if not has_sl:
+            raw_sl = avg_price * (1.0 - default_sl_ratio) if is_long else avg_price * (1.0 + default_sl_ratio)
+            target_sl, _ = self.sanitize_price_by_instrument(pair, raw_sl, is_tp=False, is_long=is_long, mark_price=mark_p)
 
         logger.info(
-            f"[AUTO-HEAL 1-MIN] Missing triggers detected on {pair} (TP: {has_tp}, SL: {has_sl}). "
-            f"Attaching algorithmic triggers: TP={target_tp}, SL={target_sl} (Entry: {avg_price})"
+            f"🛡️ [AUTO-HEAL 1-MIN] Missing triggers detected on {pair} (TP: {has_tp}, SL: {has_sl}). "
+            f"Attaching sanitized triggers: TP={target_tp}, SL={target_sl} (Entry: {avg_price}, Mark: {mark_p})"
         )
 
         res = await self.create_futures_tpsl(
             position_id=pos_id,
             tp_stop_price=target_tp,
-            sl_stop_price=target_sl
+            sl_stop_price=target_sl,
+            is_long=is_long,
+            mark_price=mark_p,
+            pair=pair
         )
 
         # Update position record in place
-        position["take_profit_trigger"] = target_tp
-        position["stop_loss_trigger"] = target_sl
-        position["tp_price"] = target_tp
-        position["sl_price"] = target_sl
+        if target_tp:
+            position["take_profit_trigger"] = target_tp
+            position["tp_price"] = target_tp
+        if target_sl:
+            position["stop_loss_trigger"] = target_sl
+            position["sl_price"] = target_sl
 
         return {
             "status": "auto_healed",
             "pair": pair,
             "position_id": pos_id,
-            "attached_tp": target_tp,
-            "attached_sl": target_sl,
+            "attached_tp": target_tp or existing_tp,
+            "attached_sl": target_sl or existing_sl,
             "entry_price": avg_price,
+            "mark_price": mark_p,
             "result": res
         }
 

@@ -30,6 +30,15 @@ from market_screener import MarketScreener
 from win_win_strategy import WinWinExecutionEngine
 from risk_manager import AlphaRiskManager
 from binance_client import to_binance_symbol
+from db import (
+    mark_trade_closed,
+    init_sqlite_db,
+    neon_manager,
+    get_24h_analytics,
+    save_equity_snapshot,
+    log_ai_signal,
+    load_closed_trades
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("AlphaScalper.Server")
@@ -112,6 +121,33 @@ coindcx_cache: Dict[str, Any] = {
     "ttl_seconds": 60.0  # Strictly throttled to 1 minute (60s)
 }
 
+# Rolling 24-Hour Analytics Cache (Neon Cloud PostgreSQL / SQLite Mirror)
+cached_analytics_24h: Dict[str, Any] = {
+    "status": "success",
+    "database": "Neon Cloud PostgreSQL (Primary)",
+    "neon_connected": True,
+    "period": "24h_rolling",
+    "tp1_hits": 0,
+    "tp2_hits": 0,
+    "sl_hits": 0,
+    "breakeven_exits": 0,
+    "total_trades_24h": 0,
+    "winning_trades_24h": 0,
+    "losing_trades_24h": 0,
+    "win_rate_24h_pct": 0.0,
+    "profit_factor_24h": 0.0,
+    "earned_24h_usdt": 0.0,
+    "lost_24h_usdt": 0.0,
+    "net_pnl_24h_usdt": 0.0,
+    "earned_24h_inr": 0.0,
+    "lost_24h_inr": 0.0,
+    "net_pnl_24h_inr": 0.0,
+    "total_fees_24h_usdt": 0.0,
+    "total_fees_24h_inr": 0.0,
+    "inr_rate": 87.5,
+    "updated_at": 0.0
+}
+
 async def coindcx_sync_1min_loop():
     """
     Periodic background worker running strictly every 1 minute (60s):
@@ -167,6 +203,38 @@ async def coindcx_sync_1min_loop():
                         except Exception as hr_err:
                             logger.error(f"Error during 1-min TP/SL auto-healing for {p.get('pair')}: {hr_err}")
 
+            # Bidirectional Reconciliation: Evict closed positions from engine memory and SQLite
+            if isinstance(live_pos, list) and not client.is_paper:
+                active_exchange_symbols = {
+                    p.get("pair") for p in live_pos
+                    if isinstance(p, dict) and abs(safe_float(p.get("active_pos"), 0.0)) > 1e-6
+                }
+                for trade_id, trade in list(execution_engine.active_trades.items()):
+                    if trade.symbol not in active_exchange_symbols:
+                        logger.info(f"🔄 [RECONCILE 1-MIN] Position {trade.symbol} is closed on CoinDCX. Evicting from active engine memory.")
+                        trade.remaining_qty = 0.0
+                        trade.exit_time = now
+                        trade.current_state = "EXCHANGE_CLOSED"
+                        execution_engine.closed_trades.append(trade)
+                        execution_engine.active_trades.pop(trade_id, None)
+                        mark_trade_closed(trade_id, now, trade.net_realized_pnl, "EXCHANGE_CLOSED")
+                        risk_manager.record_trade_exit(trade.symbol)
+                        await broadcast_event("execution_event", {
+                            "type": "RECONCILED_EXIT",
+                            "symbol": trade.symbol,
+                            "trade_id": trade_id,
+                            "message": f"Reconciliation: Closed position on {trade.symbol} confirmed by CoinDCX. Memory and slot freed."
+                        })
+
+                # Adoption: If CoinDCX has an open position NOT in active_trades, adopt it into the tick loop
+                for p in live_pos:
+                    if isinstance(p, dict) and abs(safe_float(p.get("active_pos"), 0.0)) > 1e-6:
+                        p_pair = p.get("pair")
+                        if p_pair and not any(t.symbol == p_pair for t in execution_engine.active_trades.values()):
+                            adopted = execution_engine.adopt_exchange_position(p)
+                            if adopted:
+                                logger.info(f"🛡️ [ADOPT 1-MIN] Adopted active CoinDCX position {p_pair} into WinWin tick monitor.")
+
             coindcx_cache["positions"] = live_pos or []
             coindcx_cache["positions_last_fetched"] = now
             coindcx_cache["orders"] = orders or []
@@ -181,6 +249,41 @@ async def coindcx_sync_1min_loop():
         except Exception as e:
             logger.error(f"Error in coindcx_sync_1min_loop: {e}")
             await asyncio.sleep(5.0)
+
+async def neon_equity_snapshot_loop():
+    """
+    Periodic background worker (running every 5 minutes) logging real-time portfolio equity
+    and margin metrics to Neon Cloud PostgreSQL & local SQLite mirror.
+    """
+    logger.info("AlphaScalper Neon Cloud Equity Snapshot worker started!")
+    while True:
+        try:
+            await asyncio.sleep(300.0)  # Every 5 minutes
+            active_cnt = len(execution_engine.active_trades)
+            unrealized = sum(t.unrealized_pnl for t in execution_engine.active_trades.values())
+            margin_used = sum(t.total_size_usdt / max(1.0, t.leverage) for t in execution_engine.active_trades.values())
+
+            usdt_bal = risk_manager.current_capital
+            inr_bal = usdt_bal * 87.5
+            if not client.is_paper:
+                try:
+                    w = await client.get_futures_inr_balance()
+                    if w and w.get("total_inr", 0.0) > 0:
+                        inr_bal = w["total_inr"]
+                except Exception:
+                    pass
+
+            save_equity_snapshot(
+                wallet_inr=round(inr_bal, 2),
+                wallet_usdt=round(usdt_bal, 4),
+                unrealized_pnl=round(unrealized, 4),
+                active_positions_count=active_cnt,
+                margin_used=round(margin_used, 4)
+            )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"Neon equity snapshot error: {e}")
 
 async def deep_ai_screener_loop():
     """Continuous background worker running deep multi-factor market analysis on dynamic intervals (20s - 45s)."""
@@ -208,6 +311,17 @@ async def deep_ai_screener_loop():
                     leverage=engine_state.get("leverage", settings.DEFAULT_LEVERAGE)
                 )
                 latest_scan_result = scan_res
+
+                # Log top candidates to Neon Cloud PostgreSQL / SQLite audit trail
+                for cand in scan_res.get("top_10_filtered", [])[:5]:
+                    log_ai_signal(
+                        symbol=cand["symbol"],
+                        direction=cand["signal"],
+                        confidence=float(cand.get("confidence", 0.0)),
+                        volatility_regime=cand.get("regime", "NORMAL"),
+                        obi_score=float(cand.get("obi_10", 0.0)),
+                        executed=False
+                    )
                 
                 # Keep Binance WebSocket streaming top 10 candidates + any active trade symbols
                 top_syms = [c["symbol"] for c in scan_res.get("top_10_filtered", [])]
@@ -246,6 +360,8 @@ async def scalper_orchestrator_loop():
                 min_conf = float(engine_state.get("min_confidence", 62.0))
                 candidates_to_eval = scan_res.get("ranked_targets") or scan_res.get("top_10_filtered", [])
                 for candidate in candidates_to_eval:
+                    if candidate.get("is_synthetic", False):
+                        continue
                     sig = candidate.get("signal", "NEUTRAL")
                     is_ev_viable = candidate.get("is_ev_viable", True)
                     if candidate.get("confidence", 0.0) >= min_conf and ("BUY" in sig or "SELL" in sig) and is_ev_viable:
@@ -335,12 +451,23 @@ async def scalper_orchestrator_loop():
                                             leverage=trade.leverage
                                         )
                                         logger.info(f"[LIVE SYNC] Scaled out 50% ({half_qty}) on CoinDCX for {trade.symbol} @ ${curr_p}")
+                                    else:
+                                        # CoinDCX minimum order rule: $6.00 USDT.
+                                        # Revert memory reduction so in-memory quantity remains synchronized with 100% position on exchange.
+                                        trade.remaining_qty += half_qty
+                                        logger.info(
+                                            f"[SMART SCALE-OUT] Half notional (${half_notional:.2f}) < $6.00 min contract. "
+                                            f"Retaining 100% position ({trade.remaining_qty}) on {trade.symbol} and ratcheting SL to Breakeven (+Fees)!"
+                                        )
                                     
+                                    is_long_pos = (trade.side.upper() == "BUY")
                                     await client.cancel_all_open_orders_for_position(trade.symbol)
                                     await client.create_futures_tpsl(
                                         position_id=trade.symbol,
                                         tp_stop_price=trade.tp2_price,
-                                        sl_stop_price=trade.breakeven_sl
+                                        sl_stop_price=trade.breakeven_sl,
+                                        is_long=is_long_pos,
+                                        pair=trade.symbol
                                     )
                                     logger.info(f"[LIVE SYNC] Ratcheted exchange SL on CoinDCX for {trade.symbol} to Breakeven: {trade.breakeven_sl}")
                                 except Exception as be_err:
@@ -382,11 +509,23 @@ async def scalper_orchestrator_loop():
                 capital_usdt = round(risk_manager.current_capital, 2)
                 capital_inr = round(capital_usdt * inr_rate, 2)
 
+                # Refresh rolling 24h performance metrics every 2 seconds
+                global cached_analytics_24h
+                now_epoch = time.time()
+                if now_epoch - cached_analytics_24h.get("updated_at", 0.0) >= 2.0:
+                    try:
+                        cached_analytics_24h = await get_24h_analytics(inr_rate=inr_rate)
+                    except Exception as err_24h:
+                        logger.debug(f"Error fetching 24h rolling analytics: {err_24h}")
+
                 telemetry = {
                     "timestamp": int(time.time() * 1000),
                     "is_running": engine_state["is_running"],
                     "mode": engine_state["mode"],
                     "trading_mode": settings.TRADING_MODE,
+                    "account_currency": getattr(client, "account_currency", "INR"),
+                    "currency_symbol": "₹" if getattr(client, "account_currency", "INR") == "INR" else "$",
+                    "analytics_24h": cached_analytics_24h,
                     "latency_ms": loop_latency_ms,
                     "avg_latency_ms": round(sum(engine_state["latency_history"]) / len(engine_state["latency_history"]), 2),
                     "daily_pnl": daily_pnl_usdt,
@@ -446,6 +585,14 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting AlphaScalper Services...")
     
+    # 0. Initialize Neon Cloud PostgreSQL & SQLite WAL Persistence
+    init_sqlite_db()
+    neon_connected = await neon_manager.connect()
+    if neon_connected:
+        logger.info("Neon Cloud PostgreSQL connected and operational.")
+    else:
+        logger.warning("Neon Cloud PostgreSQL unavailable on boot. Operating in local SQLite WAL resilience mode.")
+
     # 1. Verify CoinDCX External API Connectivity and Live Account Balances
     verification = await client.verify_api_connectivity(force_refresh=True)
     logger.info("==================================================")
@@ -469,7 +616,21 @@ async def lifespan(app: FastAPI):
         is_live=(verification.get("trading_mode") == "LIVE")
     )
 
-    # 3. Initialize Market Universe and Feeds
+    # 3. Reconcile open exchange positions on boot to prevent orphan positions
+    if not client.is_paper:
+        try:
+            boot_positions = await client.get_futures_positions()
+            for p in boot_positions:
+                if isinstance(p, dict) and abs(safe_float(p.get("active_pos"), 0.0)) > 1e-6:
+                    p_sym = p.get("pair")
+                    if p_sym and not any(t.symbol == p_sym for t in execution_engine.active_trades.values()):
+                        execution_engine.adopt_exchange_position(p)
+            if execution_engine.active_trades:
+                logger.info(f"Startup position reconciliation complete: {len(execution_engine.active_trades)} active trades monitored.")
+        except Exception as boot_pos_err:
+            logger.warning(f"Startup positions check error: {boot_pos_err}")
+
+    # 4. Initialize Market Universe and Feeds
     await screener.initialize_universe()
     try:
         init_scan = await screener.scan_and_filter_market(
@@ -495,7 +656,8 @@ async def lifespan(app: FastAPI):
     task_orchestrator = asyncio.create_task(scalper_orchestrator_loop())
     task_binance_stream = asyncio.create_task(screener.binance_client.start_stream_manager())
     task_coindcx_sync = asyncio.create_task(coindcx_sync_1min_loop())
-    background_tasks.extend([task_screener, task_orchestrator, task_binance_stream, task_coindcx_sync])
+    task_equity_snapshot = asyncio.create_task(neon_equity_snapshot_loop())
+    background_tasks.extend([task_screener, task_orchestrator, task_binance_stream, task_coindcx_sync, task_equity_snapshot])
     yield
     # Shutdown
     logger.info("Stopping AlphaScalper Services...")
@@ -504,6 +666,7 @@ async def lifespan(app: FastAPI):
     await ws_manager.stop()
     await screener.binance_client.close()
     await client.close()
+    await neon_manager.close()
 
 
 fastapi_app = FastAPI(
@@ -587,10 +750,14 @@ async def connect(sid, environ):
     stats["current_capital"] = round(risk_manager.current_capital, 2)
     stats["current_capital_inr"] = round(risk_manager.current_capital * 87.5, 2)
     stats["inr_rate"] = 87.5
+    stats["account_currency"] = getattr(client, "account_currency", "INR")
+    stats["currency_symbol"] = "₹" if getattr(client, "account_currency", "INR") == "INR" else "$"
     top_10 = latest_scan_result.get("top_10_filtered", [])
     await sio.emit("initial_state", {
         "is_running": engine_state["is_running"],
         "mode": engine_state["mode"],
+        "account_currency": getattr(client, "account_currency", "INR"),
+        "currency_symbol": "₹" if getattr(client, "account_currency", "INR") == "INR" else "$",
         "config": engine_state,
         "stats": stats,
         "top_10_filtered": top_10
@@ -1363,11 +1530,15 @@ async def create_order_endpoint(req: CreateOrderRequest):
 
     # 2. Attach TP & SL triggers on CoinDCX
     tpsl_res = None
+    is_long_req = (req.side.upper() == "BUY")
     try:
         tpsl_res = await client.create_futures_tpsl(
             position_id=req.pair,
             tp_stop_price=tp1_price,
-            sl_stop_price=sl_price
+            sl_stop_price=sl_price,
+            is_long=is_long_req,
+            mark_price=current_price,
+            pair=req.pair
         )
     except Exception as e:
         logger.warning(f"Note on attaching TP/SL: {e}")
@@ -1456,7 +1627,55 @@ async def get_analytics():
     stats["daily_pnl_inr"] = round(risk_manager.daily_pnl * 87.5, 2)
     stats["inr_rate"] = 87.5
     stats["latency_history"] = engine_state["latency_history"]
+    stats["analytics_24h"] = await get_24h_analytics(inr_rate=87.5)
     return stats
+
+
+@fastapi_app.get("/api/v1/stats/analytics")
+async def get_24h_stats_analytics():
+    """
+    Returns rolling 24-hour financial metrics and execution stats from Neon Cloud PostgreSQL:
+    - TP1 Hits Count
+    - TP2 Hits Count
+    - Stop Loss Hits Count
+    - Breakeven Exits Count
+    - 24H Gross Earnings ($ and ₹)
+    - 24H Gross Losses ($ and ₹)
+    - 24H Net PnL ($ and ₹)
+    - 24H Total Fees ($ and ₹)
+    - Win Rate % & Profit Factor
+    - Neon Database Health Status
+    """
+    return await get_24h_analytics(inr_rate=87.5)
+
+
+@fastapi_app.get("/api/v1/trades/history")
+async def get_closed_trades_history(limit: int = 100):
+    """
+    Returns recent trade execution records from Neon Cloud / SQLite WAL.
+    """
+    trades = load_closed_trades(limit=limit)
+    return {
+        "status": "success",
+        "trades": trades,
+        "count": len(trades),
+        "database": "Neon Cloud PostgreSQL + SQLite WAL"
+    }
+
+
+@fastapi_app.get("/api/v1/database/status")
+async def get_database_status():
+    """
+    Checks Neon Cloud PostgreSQL connectivity and pool status.
+    """
+    return {
+        "status": "success",
+        "neon_connected": neon_manager.is_connected,
+        "database": "Neon Cloud PostgreSQL" if neon_manager.is_connected else "SQLite WAL (Local Fallback)",
+        "pool_available": neon_manager.pool is not None,
+        "region": "us-east-2 (AWS)",
+        "timestamp": time.time()
+    }
 
 
 @fastapi_app.post("/api/v1/stats/reset")

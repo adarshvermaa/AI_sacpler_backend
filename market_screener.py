@@ -66,11 +66,15 @@ class MarketScreener:
             self.raw_universe = universe
             logger.info(f"Initialized universe with {len(self.raw_universe)} instruments")
 
-        # Warm up Binance 24hr tickers cache
+        # Warm up Binance 24hr tickers cache and contract specification rules
         try:
             await self.binance_client.get_24hr_tickers()
+            rules = await self.binance_client.get_exchange_info()
+            if rules and hasattr(self.client, "update_contract_rules"):
+                self.client.update_contract_rules(rules)
+                logger.info(f"Synchronized {len(rules)} contract tick & precision rules with CoinDCX client")
         except Exception as e:
-            logger.debug(f"Binance tickers warm-up: {e}")
+            logger.debug(f"Binance tickers/rules warm-up: {e}")
 
     async def _fetch_and_cache_candles(self, symbol: str, resolution: str = "1") -> Optional[Dict[str, np.ndarray]]:
         """Fetch real multi-timeframe historical candlestick bars directly from Binance Futures (with CoinDCX fallback)."""
@@ -530,58 +534,66 @@ class MarketScreener:
                     if len(top_10) == 10:
                         break
 
-        # Absolute guarantee: ensure exactly 10 items are always populated
+        # Absolute guarantee: ensure exactly 10 items are always populated using REAL prices
         if len(top_10) < 10:
             default_symbols = ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT", "B-XRP_USDT", "B-DOGE_USDT", "B-SUI_USDT", "B-ADA_USDT", "B-AVAX_USDT", "B-LINK_USDT", "B-NEAR_USDT"]
             for s in default_symbols:
                 if s not in seen_syms:
-                    idx = len(top_10)
-                    is_even = (idx % 2 == 0)
+                    b_sym = to_binance_symbol(s)
+                    real_price = self.binance_client.latest_prices.get(b_sym, 0.0)
+                    if real_price <= 0.0:
+                        ticker = self.binance_client.latest_tickers.get(b_sym, {})
+                        real_price = float(ticker.get("lastPrice", 0.0))
+                    if real_price <= 0.0:
+                        cand = self._candle_cache.get(s, {})
+                        real_price = float(cand.get("close", [100.0])[-1]) if cand else 100.0
+
                     top_10.append({
                         "symbol": s,
-                        "price": 100.0,
-                        "volume_24h": 500000.0,
-                        "spread_pct": 0.02,
-                        "change_24h": 1.5 if is_even else -1.2,
-                        "high_24h": 102.0,
-                        "low_24h": 98.0,
-                        "mark_price": 100.0,
-                        "signal": "BUY" if is_even else "SELL",
-                        "confidence": round(80.0 + (idx * 1.7) % 18.0, 1),
-                        "win_probability_pct": round(75.0 + (idx * 2.1) % 15.0, 1),
-                        "expected_value_pct": 1.8,
-                        "is_ev_viable": True,
-                        "regime": "TRENDING_BULL" if is_even else "TRENDING_BEAR",
-                        "entry_type": "MARKET_TAKER",
-                        "entry_price": 100.0,
-                        "market_price": 100.0,
-                        "tp1_price": 101.5,
-                        "tp2_price": 103.0,
-                        "sl_price": 99.0,
-                        "breakeven_trigger": 101.0,
-                        "breakeven_sl": 100.1,
+                        "price": fmt(real_price),
+                        "volume_24h": 0.0,
+                        "spread_pct": 0.04,
+                        "change_24h": 0.0,
+                        "high_24h": fmt(real_price * 1.01),
+                        "low_24h": fmt(real_price * 0.99),
+                        "mark_price": fmt(real_price),
+                        "signal": "NEUTRAL",
+                        "confidence": 0.0,
+                        "win_probability_pct": 50.0,
+                        "expected_value_pct": 0.0,
+                        "is_ev_viable": False,
+                        "regime": "RANGING_CONSOLIDATION",
+                        "entry_type": "MARKET",
+                        "entry_price": fmt(real_price),
+                        "market_price": fmt(real_price),
+                        "tp1_price": fmt(real_price * 1.0085),
+                        "tp2_price": fmt(real_price * 1.0180),
+                        "sl_price": fmt(real_price * 0.9955),
+                        "breakeven_trigger": fmt(real_price * 1.0040),
+                        "breakeven_sl": fmt(real_price * 1.0010),
                         "risk_r": 1.0,
-                        "rr_ratio": 2.0,
-                        "latency_us": 120,
-                        "vol_surge": 1.4,
-                        "obi_10": 0.25,
-                        "rsi_14": 55.0,
-                        "supertrend_bull": is_even,
-                        "candlestick_pattern": 0.8,
-                        "swing_high": 102.0,
-                        "swing_low": 98.0,
-                        "support_level": 98.5,
-                        "resistance_level": 102.5,
-                        "atr_pct": 0.8,
-                        "relative_strength": 1.15,
+                        "rr_ratio": 1.8,
+                        "latency_us": 100,
+                        "vol_surge": 1.0,
+                        "obi_10": 0.0,
+                        "rsi_14": 50.0,
+                        "supertrend_bull": True,
+                        "candlestick_pattern": 0.0,
+                        "swing_high": fmt(real_price * 1.01),
+                        "swing_low": fmt(real_price * 0.99),
+                        "support_level": fmt(real_price * 0.992),
+                        "resistance_level": fmt(real_price * 1.008),
+                        "atr_pct": 0.5,
+                        "relative_strength": 1.0,
                         "btc_regime": "NEUTRAL",
-                        "tri_timeframe_alignment": 0.8,
-                        "mtf_confirmed": True,
-                        "delta_volume_ratio": 0.2 if is_even else -0.2,
-                        "tf_15m_bias": 0.5,
-                        "tf_5m_bias": 0.6,
-                        "tf_1m_bias": 0.4,
-                        "is_authentic_mtf": True
+                        "tri_timeframe_alignment": 0.0,
+                        "mtf_confirmed": False,
+                        "delta_volume_ratio": 0.0,
+                        "tf_15m_bias": 0.0,
+                        "tf_5m_bias": 0.0,
+                        "tf_1m_bias": 0.0,
+                        "is_authentic_mtf": False,
+                        "is_synthetic": True
                     })
                     seen_syms.add(s)
                     if len(top_10) == 10:

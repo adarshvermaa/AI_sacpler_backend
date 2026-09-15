@@ -3,7 +3,7 @@ AlphaScalper - Core Configuration Module
 Handles environment variables, API endpoints, risk management limits, and strategy presets.
 """
 
-from typing import List
+from typing import List, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -28,6 +28,13 @@ class AlphaScalperSettings(BaseSettings):
     
     # Webhook Secret for Inbound CoinDCX Notifications
     WEBHOOK_SECRET: str = "alphascalper_webhook_secret_key"
+    
+    # Database Configuration (Neon Cloud PostgreSQL & SQLite Mirror)
+    NEON_DATABASE_URL: Optional[str] = Field(
+        default="postgresql://neondb_owner:npg_AyhxEcw32tBs@ep-steep-recipe-ayz9zzur-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require",
+        description="Neon Cloud PostgreSQL connection URI"
+    )
+    ENABLE_NEON_CLOUD: bool = True
     
     # Server Configuration
     HOST: str = "0.0.0.0"

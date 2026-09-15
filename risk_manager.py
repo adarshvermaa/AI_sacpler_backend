@@ -36,7 +36,7 @@ class AlphaRiskManager:
         
         # Real CoinDCX INR Collateral Equity Circuit Breaker
         self.starting_session_inr_equity: Optional[float] = None
-        self.max_session_drawdown_inr: float = 100.0   # Strict ₹100 INR drawdown cap (~$1.15 USDT)
+        self.max_session_drawdown_inr: float = 250.0   # Dynamically scaled (5% of capital or min ₹200)
 
     def record_trade_entry(self, symbol: str):
         """Records timestamp of an open order to prevent burst orders."""
@@ -58,6 +58,8 @@ class AlphaRiskManager:
             return
         if self.starting_session_inr_equity is None:
             self.starting_session_inr_equity = total_inr
+            self.max_session_drawdown_inr = max(200.0, total_inr * (settings.MAX_DAILY_DRAWDOWN_PERCENT / 100.0))
+            logger.info(f"[RISK MANAGER] Session INR equity initialized: ₹{total_inr:.2f} | Dynamic Drawdown Limit: ₹{self.max_session_drawdown_inr:.2f} INR")
 
         delta_inr = total_inr - self.starting_session_inr_equity
         delta_usdt = delta_inr / inr_usd_rate
@@ -231,14 +233,21 @@ class AlphaRiskManager:
         min_margin_req = self.min_order_notional / max(1.0, leverage)
         
         if self.is_live_mode:
+            # Enforce strict single-trade margin ceiling: maximum 20% of current equity per trade
+            max_trade_margin = self.current_capital * 0.20
+            max_trade_notional = round(max_trade_margin * leverage, 2)
+            target_notional = min(target_notional, max_trade_notional)
+
             if target_notional < self.min_order_notional:
                 if min_margin_req <= self.current_capital * 0.85:
                     target_notional = self.min_order_notional
                 else:
                     return 0.0
-            max_notional = round(self.current_capital * 0.85 * leverage, 2)
-            return min(target_notional, max_notional)
+            max_account_notional = round(self.current_capital * 0.85 * leverage, 2)
+            return min(target_notional, max_account_notional)
         else:
+            max_trade_notional = round(self.current_capital * 0.25 * leverage, 2)
+            target_notional = min(target_notional, max_trade_notional)
             return max(self.min_order_notional, min(target_notional, round(self.current_capital * 0.50 * leverage, 2)))
 
     def validate_leverage(self, requested_leverage: float, notional_value: float) -> float:

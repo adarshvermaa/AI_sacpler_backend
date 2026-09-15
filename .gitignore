@@ -38,6 +38,8 @@ venv.bak/
 .env
 .env.*
 *.env
+!.env.example
+
 
 # Testing & Type Checking
 .pytest_cache/

@@ -60,12 +60,13 @@ class BinanceClient:
         self,
         fapi_base_url: str = "https://fapi.binance.com",
         api_base_url: str = "https://api.binance.com",
-        ws_stream_url: str = "wss://stream.binance.com:9443/stream"
+        ws_stream_url: str = "wss://fstream.binance.com/stream"
     ):
         self.fapi_base_url = fapi_base_url.rstrip("/")
         self.api_base_url = api_base_url.rstrip("/")
         self.ws_stream_url = ws_stream_url
         self._http_client: Optional[httpx.AsyncClient] = None
+        self._active_ws = None
         
         # In-memory latest market state
         self.latest_tickers: Dict[str, Dict[str, Any]] = {}   # BinanceSymbol -> TickerDict
@@ -73,6 +74,7 @@ class BinanceClient:
         self.latest_klines_1m: Dict[str, Dict[str, Any]] = {} # BinanceSymbol -> KlineDict
         self.is_streaming: bool = False
         self._stream_task: Optional[asyncio.Task] = None
+        self._contract_rules: Dict[str, Dict[str, Any]] = {}  # BinanceSymbol -> RuleDict
         self._monitored_symbols: List[str] = ["btcusdt", "ethusdt", "solusdt"]
 
     async def get_client(self) -> httpx.AsyncClient:
@@ -127,6 +129,57 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Error fetching Binance 24hr tickers: {e}")
             return []
+
+    async def get_exchange_info(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """
+        Fetches and caches Binance Futures contract specifications:
+        tickSize (price filter), stepSize (lot size), minQty, pricePrecision, minNotional.
+        """
+        if self._contract_rules and not force_refresh:
+            return self._contract_rules
+        client = await self.get_client()
+        try:
+            resp = await client.get(f"{self.fapi_base_url}/fapi/v1/exchangeInfo", timeout=8.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                for s in data.get("symbols", []):
+                    sym = s.get("symbol")
+                    if not sym:
+                        continue
+                    price_precision = int(s.get("pricePrecision", 2))
+                    qty_precision = int(s.get("quantityPrecision", 3))
+                    tick_size = 0.01
+                    step_size = 0.001
+                    min_qty = 0.001
+                    min_notional = 5.0
+                    for f in s.get("filters", []):
+                        ftype = f.get("filterType")
+                        if ftype == "PRICE_FILTER":
+                            tick_size = float(f.get("tickSize", 0.01))
+                        elif ftype == "LOT_SIZE":
+                            step_size = float(f.get("stepSize", 0.001))
+                            min_qty = float(f.get("minQty", 0.001))
+                        elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
+                            min_notional = float(f.get("notional", 5.0))
+                    self._contract_rules[sym] = {
+                        "symbol": sym,
+                        "price_precision": price_precision,
+                        "quantity_precision": qty_precision,
+                        "tick_size": tick_size,
+                        "step_size": step_size,
+                        "min_qty": min_qty,
+                        "min_notional": min_notional,
+                    }
+                logger.info(f"Cached contract rules for {len(self._contract_rules)} Binance Futures pairs")
+        except Exception as e:
+            logger.debug(f"Error fetching Binance exchangeInfo: {e}")
+        return self._contract_rules
+
+    def get_contract_rule(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Returns cached contract rules for symbol (supports B-BTC_USDT, BTCUSDT, etc.)."""
+        b_sym = to_binance_symbol(symbol)
+        return self._contract_rules.get(b_sym)
+
 
     async def get_klines(
         self,
@@ -293,8 +346,22 @@ class BinanceClient:
             bs = to_binance_symbol(s).lower()
             if bs and bs not in clean:
                 clean.append(bs)
-        # Limit to top 25 active symbols to stay comfortably within single socket stream limits
-        self._monitored_symbols = clean[:25]
+        new_symbols = clean[:25]
+        diff = [s for s in new_symbols if s not in self._monitored_symbols]
+        self._monitored_symbols = new_symbols
+
+        # If WebSocket is actively connected, send dynamic JSON-RPC SUBSCRIBE frame
+        if diff and self._active_ws:
+            try:
+                sub_msg = {
+                    "method": "SUBSCRIBE",
+                    "params": [f"{s}@kline_1m" for s in diff],
+                    "id": int(time.time() * 1000)
+                }
+                asyncio.create_task(self._active_ws.send(json.dumps(sub_msg)))
+                logger.info(f"BinanceStreamManager dynamic subscription sent for {len(diff)} symbols: {diff}")
+            except Exception as e:
+                logger.debug(f"Dynamic subscribe error: {e}")
 
     async def start_stream_manager(self, on_price_update=None):
         """
@@ -311,7 +378,8 @@ class BinanceClient:
                 url = f"{self.ws_stream_url}?streams={stream_path}"
 
                 async with websockets.connect(url, ping_interval=20, close_timeout=5) as ws:
-                    logger.info("BinanceStreamManager: WebSocket connected successfully!")
+                    self._active_ws = ws
+                    logger.info("BinanceStreamManager: USD-M Futures WebSocket connected successfully!")
                     while self.is_streaming:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=10.0)

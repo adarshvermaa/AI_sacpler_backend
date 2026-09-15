@@ -14,6 +14,7 @@ from typing import Dict, Any, List, Optional
 
 from config import settings
 from coindcx_client import CoinDCXClient
+from db import init_db, save_trade, load_active_trades, mark_trade_closed, load_closed_trades, log_trade_event
 
 logger = logging.getLogger("AlphaScalper.WinWinStrategy")
 
@@ -47,11 +48,11 @@ class WinWinTrade:
         self.symbol = symbol
         self.side = side.upper()
         self.total_size_usdt = total_size_usdt
-        self.entry_price = round(entry_price, 6)
-        self.tp1_price = round(tp1_price, 6)
-        self.tp2_price = round(tp2_price, 6)
-        self.sl_price = round(sl_price, 6)
-        self.breakeven_sl = round(breakeven_sl, 6)
+        self.entry_price = float(entry_price)
+        self.tp1_price = float(tp1_price)
+        self.tp2_price = float(tp2_price)
+        self.sl_price = float(sl_price)
+        self.breakeven_sl = float(breakeven_sl)
         self.leverage = leverage
         
         self.current_state = WinWinOrderState.PENDING_ENTRY
@@ -89,6 +90,111 @@ class WinWinExecutionEngine:
         self.closed_trades: List[WinWinTrade] = []
         self.trade_counter = 0
 
+        # Initialize SQLite WAL store and reload any active trades across restarts
+        try:
+            init_db()
+            loaded_active = load_active_trades()
+            for row in loaded_active:
+                t = WinWinTrade(
+                    trade_id=row["trade_id"],
+                    symbol=row["symbol"],
+                    side=row["side"],
+                    total_size_usdt=float(row["total_size_usdt"]),
+                    entry_price=float(row["entry_price"]),
+                    tp1_price=float(row["tp1_price"]),
+                    tp2_price=float(row["tp2_price"]),
+                    sl_price=float(row["sl_price"]),
+                    breakeven_sl=float(row["breakeven_sl"]),
+                    leverage=float(row["leverage"])
+                )
+                t.current_state = row["current_state"]
+                t.filled_qty = float(row["filled_qty"])
+                t.remaining_qty = float(row["remaining_qty"])
+                t.realized_pnl = float(row.get("realized_pnl") or 0.0)
+                t.total_fees_paid = float(row.get("total_fees_paid") or 0.0)
+                t.net_realized_pnl = float(row.get("net_realized_pnl") or 0.0)
+                t.is_risk_free = bool(row.get("is_risk_free"))
+                t.created_at = float(row["created_at"])
+                t.entry_time = float(row["entry_time"]) if row.get("entry_time") else None
+                self.active_trades[t.trade_id] = t
+            if self.active_trades:
+                logger.info(f"Restored {len(self.active_trades)} active trades from SQLite persistence store.")
+        except Exception as db_err:
+            logger.error(f"Error restoring trades from DB: {db_err}")
+
+    def adopt_exchange_position(self, pos: Dict[str, Any]) -> Optional[WinWinTrade]:
+        """
+        Adopts a pre-existing or externally opened exchange position into the WinWin engine.
+        Constructs a safe WinWinTrade with algorithmic bracket levels and commits to SQLite.
+        """
+        pair = pos.get("pair")
+        active_pos = float(pos.get("active_pos") or 0.0)
+        if not pair or abs(active_pos) <= 1e-6:
+            return None
+
+        # Check if already tracked
+        if any(t.symbol == pair for t in self.active_trades.values()):
+            return None
+
+        side = "buy" if active_pos > 0 else "sell"
+        entry_p = float(pos.get("avg_price") or 100.0)
+        lev = float(pos.get("leverage") or settings.DEFAULT_LEVERAGE)
+        total_qty = abs(active_pos)
+        notional = round(total_qty * entry_p, 4)
+
+        self.trade_counter += 1
+        trade_id = f"ADOPT-{pair}-{int(time.time())}"
+
+        # Calculate conservative bracket levels
+        tp1_r = settings.TP1_RATIO
+        hard_sl_r = settings.HARD_SL_RATIO
+        is_long_pos = (side == "buy")
+        if is_long_pos:
+            raw_tp1 = entry_p * (1.0 + tp1_r)
+            raw_tp2 = entry_p * (1.0 + tp1_r * 2.2)
+            raw_sl = entry_p * (1.0 - hard_sl_r)
+            raw_be = entry_p * (1.0 + 0.0008)
+        else:
+            raw_tp1 = entry_p * (1.0 - tp1_r)
+            raw_tp2 = entry_p * (1.0 - tp1_r * 2.2)
+            raw_sl = entry_p * (1.0 + hard_sl_r)
+            raw_be = entry_p * (1.0 - 0.0008)
+
+        tp1_p, _ = self.client.sanitize_price_by_instrument(pair, raw_tp1, is_tp=True, is_long=is_long_pos, mark_price=entry_p)
+        tp2_p, _ = self.client.sanitize_price_by_instrument(pair, raw_tp2, is_tp=True, is_long=is_long_pos, mark_price=entry_p)
+        sl_p, _ = self.client.sanitize_price_by_instrument(pair, raw_sl, is_tp=False, is_long=is_long_pos, mark_price=entry_p)
+        be_sl, _ = self.client.sanitize_price_by_instrument(pair, raw_be, is_tp=False, is_long=is_long_pos, mark_price=entry_p)
+
+        trade = WinWinTrade(
+            trade_id=trade_id,
+            symbol=pair,
+            side=side,
+            total_size_usdt=notional,
+            entry_price=entry_p,
+            tp1_price=tp1_p,
+            tp2_price=tp2_p,
+            sl_price=sl_p,
+            breakeven_sl=be_sl,
+            leverage=lev
+        )
+        trade.current_state = WinWinOrderState.TIER1_FILLED
+        trade.filled_qty = total_qty
+        trade.remaining_qty = total_qty
+        trade.entry_time = time.time()
+
+        self.active_trades[trade_id] = trade
+        save_trade(trade)
+        log_trade_event(
+            trade_id=trade.trade_id,
+            symbol=pair,
+            event_type="ENTRY",
+            price=trade.entry_price,
+            qty=trade.filled_qty,
+            message=f"Adopted open position on {pair} ({side.upper()} @ ${entry_p})"
+        )
+        logger.info(f"Adopted open exchange position {pair} ({side.upper()} {total_qty} @ ${entry_p}) into WinWin engine!")
+        return trade
+
     async def execute_win_win_entry(
         self,
         symbol: str,
@@ -105,19 +211,26 @@ class WinWinExecutionEngine:
         Submits the Tri-Tier Multi-Order Slices and registers bracket state.
         """
         self.trade_counter += 1
+        is_long_order = "BUY" in signal.upper()
+        safe_entry, _ = self.client.sanitize_price_by_instrument(symbol, entry_price)
+        safe_tp1, _ = self.client.sanitize_price_by_instrument(symbol, tp1_price, is_tp=True, is_long=is_long_order, mark_price=safe_entry)
+        safe_tp2, _ = self.client.sanitize_price_by_instrument(symbol, tp2_price, is_tp=True, is_long=is_long_order, mark_price=safe_entry)
+        safe_sl, _ = self.client.sanitize_price_by_instrument(symbol, sl_price, is_tp=False, is_long=is_long_order, mark_price=safe_entry)
+        safe_be, _ = self.client.sanitize_price_by_instrument(symbol, breakeven_sl, is_tp=False, is_long=is_long_order, mark_price=safe_entry)
+
         trade_id = f"WW-{int(time.time())}-{self.trade_counter}"
-        side = "buy" if "BUY" in signal else "sell"
+        side = "buy" if is_long_order else "sell"
 
         trade = WinWinTrade(
             trade_id=trade_id,
             symbol=symbol,
             side=side,
             total_size_usdt=allocated_usdt,
-            entry_price=entry_price,
-            tp1_price=tp1_price,
-            tp2_price=tp2_price,
-            sl_price=sl_price,
-            breakeven_sl=breakeven_sl,
+            entry_price=safe_entry,
+            tp1_price=safe_tp1,
+            tp2_price=safe_tp2,
+            sl_price=safe_sl,
+            breakeven_sl=safe_be,
             leverage=leverage
         )
 
@@ -171,6 +284,7 @@ class WinWinExecutionEngine:
                 side=side,
                 order_type="market_order",
                 total_quantity=safe_qty,
+                price=trade.entry_price,
                 leverage=safe_lev
             )
             order_qty = safe_qty
@@ -183,6 +297,16 @@ class WinWinExecutionEngine:
                 if "error" in order_res or order_res.get("status") == "error":
                     logger.error(f"CoinDCX order returned error on {symbol}: {order_res}")
                     return None
+                
+                # Calibrate entry price to authentic exchange fill if returned
+                fill_p = float(order_res.get("avg_price") or order_res.get("price") or 0.0)
+                if fill_p > 0 and abs(fill_p - trade.entry_price) / max(1e-6, trade.entry_price) > 0.0001:
+                    ratio = fill_p / max(1e-6, trade.entry_price)
+                    trade.entry_price, _ = self.client.sanitize_price_by_instrument(symbol, fill_p)
+                    trade.tp1_price, _ = self.client.sanitize_price_by_instrument(symbol, trade.tp1_price * ratio, is_tp=True, is_long=is_long_order, mark_price=fill_p)
+                    trade.tp2_price, _ = self.client.sanitize_price_by_instrument(symbol, trade.tp2_price * ratio, is_tp=True, is_long=is_long_order, mark_price=fill_p)
+                    trade.sl_price, _ = self.client.sanitize_price_by_instrument(symbol, trade.sl_price * ratio, is_tp=False, is_long=is_long_order, mark_price=fill_p)
+                    trade.breakeven_sl, _ = self.client.sanitize_price_by_instrument(symbol, trade.breakeven_sl * ratio, is_tp=False, is_long=is_long_order, mark_price=fill_p)
 
             trade.current_state = WinWinOrderState.TIER1_FILLED
             trade.entry_time = time.time()
@@ -200,14 +324,26 @@ class WinWinExecutionEngine:
             try:
                 await self.client.create_futures_tpsl(
                     position_id=symbol,
-                    tp_stop_price=tp1_price,
-                    sl_stop_price=sl_price
+                    tp_stop_price=trade.tp1_price,
+                    sl_stop_price=trade.sl_price,
+                    is_long=is_long_order,
+                    mark_price=trade.entry_price,
+                    pair=symbol
                 )
             except Exception as tpsl_err:
                 logger.warning(f"Note on TP/SL creation for {symbol}: {tpsl_err}")
 
             self.active_trades[trade_id] = trade
-            logger.info(f"[{trade_id}] Win-Win Scalp Initialized on {symbol} ({side.upper()} @ {entry_price})")
+            save_trade(trade)
+            log_trade_event(
+                trade_id=trade.trade_id,
+                symbol=symbol,
+                event_type="ENTRY",
+                price=trade.entry_price,
+                qty=trade.filled_qty,
+                message=f"Live order executed on {symbol} ({side.upper()} {trade.filled_qty} @ ${trade.entry_price})"
+            )
+            logger.info(f"[{trade_id}] Win-Win Scalp Initialized on {symbol} ({side.upper()} @ {trade.entry_price})")
             return trade
 
         except Exception as e:
@@ -261,6 +397,17 @@ class WinWinExecutionEngine:
                 
                 # Dynamic Stop Loss is now locked at Breakeven + Fee Buffer
                 trade.sl_price = trade.breakeven_sl
+                save_trade(trade)
+                log_trade_event(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    event_type="TP1_HIT",
+                    price=trade.tp1_price,
+                    qty=half_qty,
+                    pnl=pnl_tp1,
+                    fee=exit_fee,
+                    message=f"TP1 Hit on {symbol}! 50% locked (+${pnl_tp1:.4f}). SL moved to Breakeven (+${trade.breakeven_sl})"
+                )
 
                 events.append({
                     "event": "WIN_WIN_BREAKEVEN_LOCKED",
@@ -294,6 +441,17 @@ class WinWinExecutionEngine:
                 trade.exit_time = now
                 self.closed_trades.append(trade)
                 self.active_trades.pop(trade_id, None)
+                mark_trade_closed(trade_id, trade.exit_time, trade.net_realized_pnl, trade.current_state)
+                log_trade_event(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    event_type="TP2_HIT",
+                    price=trade.tp2_price,
+                    qty=trade.remaining_qty,
+                    pnl=runner_pnl,
+                    fee=exit_fee,
+                    message=f"TP2 Target Hit on {symbol}! Total Scalp Net Profit: +${trade.net_realized_pnl:.4f}"
+                )
 
                 events.append({
                     "event": "WIN_WIN_TP2_MAX_PROFIT",
@@ -342,6 +500,30 @@ class WinWinExecutionEngine:
                 trade.exit_time = now
                 self.closed_trades.append(trade)
                 self.active_trades.pop(trade_id, None)
+                mark_trade_closed(trade_id, trade.exit_time, trade.net_realized_pnl, trade.current_state)
+
+                if trade.is_risk_free:
+                    log_trade_event(
+                        trade_id=trade_id,
+                        symbol=symbol,
+                        event_type="BREAKEVEN_HIT",
+                        price=trade.breakeven_sl,
+                        qty=trade.remaining_qty,
+                        pnl=be_pnl,
+                        fee=exit_fee,
+                        message=msg
+                    )
+                else:
+                    log_trade_event(
+                        trade_id=trade_id,
+                        symbol=symbol,
+                        event_type="STOP_LOSS_HIT",
+                        price=trade.sl_price,
+                        qty=trade.remaining_qty,
+                        pnl=-loss,
+                        fee=exit_fee,
+                        message=msg
+                    )
 
                 events.append({
                     "event": "STOP_EXECUTED",
